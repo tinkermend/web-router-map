@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+docs/
+test/
+.claude/
+.qoder/
+.opencode/
+.codex/
+.gemini/
