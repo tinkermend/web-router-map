@@ -213,3 +213,19 @@ test/
 .opencode/
 .codex/
 .gemini/
+.plan/
+node_modules/
+# Playwright test auth data
+.auth/
+
+logs/
+node_modules/
+test-results/
+tests/
+.qoder/
+.plan/
+.claude/
+.golutra/
+.auth/
+screenshots/
+output/
