@@ -107,8 +107,13 @@ async def init_db() -> None:
     """Initialize DB prerequisites in an idempotent way."""
 
     # Ensure table metadata is registered before create_all.
-    from src.models import storage_state as _storage_state  # noqa: F401
+    from src.models import app_page as _app_page  # noqa: F401
+    from src.models import crawl_log as _crawl_log  # noqa: F401
+    from src.models import nav_menu as _nav_menu  # noqa: F401
     from src.models import web_system as _web_system  # noqa: F401
+    from src.models import storage_state as _storage_state  # noqa: F401
+    from src.models import ui_container as _ui_container  # noqa: F401
+    from src.models import ui_element as _ui_element  # noqa: F401
 
     schema = _validated_schema(get_settings().database_schema)
     async with get_engine().begin() as conn:

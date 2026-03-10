@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from src.api import api_router
 from src.models.database import close_db, init_db
 from src.scheduler import distributed_lock, scheduler_manager
-from src.scheduler.jobs import sync_auth_jobs
+from src.scheduler.jobs import sync_scheduler_jobs
 
 
 @asynccontextmanager
@@ -17,7 +17,7 @@ async def lifespan(_app: FastAPI):
     await init_db()
     scheduler_manager.start()
     if scheduler_manager.scheduler.running:
-        await sync_auth_jobs()
+        await sync_scheduler_jobs()
 
     try:
         yield

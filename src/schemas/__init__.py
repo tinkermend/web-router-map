@@ -6,10 +6,13 @@ from src.schemas.auth import (
     LatestStateResponse,
     ManualStatePayload,
 )
+from src.schemas.crawl import CrawlRunRequest, CrawlRunResponse
 
 __all__ = [
     "AuthRefreshRequest",
     "AuthRefreshResponse",
+    "CrawlRunRequest",
+    "CrawlRunResponse",
     "LatestStateResponse",
     "ManualStatePayload",
 ]

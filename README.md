@@ -64,3 +64,12 @@
   - `POST /api/auth/manual-state/{sys_code}`: 手动注入状态快照
 - CLI:
   - `python scripts/refresh-storage-state.py --sys-code ele.vben.pro --headed`
+
+## 菜单地图采集（DB状态驱动）
+
+- API:
+  - `POST /api/crawl/run/{sys_code}`: 使用 DB 中最新有效 `storage_states` 触发采集并写入 `nav_menus/app_pages/ui_containers/ui_elements`
+- CLI:
+  - `python scripts/crawl-menu-map-from-db.py --sys-code ele.vben.pro --max-pages 10`
+- 说明:
+  - 采集器复用 `scripts/crawl-menu-map.py` 能力，服务层负责状态加载、失效触发认证、结果入库与统计日志。

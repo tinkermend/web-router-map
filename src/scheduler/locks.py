@@ -35,19 +35,24 @@ class DistributedLock:
         if redis_client is not None:
             try:
                 acquired = await redis_client.set(key, token, nx=True, ex=ttl)
+            except Exception:
+                # Redis unavailable: fallback to local lock.
+                acquired = None
+            else:
                 if not acquired:
                     yield False
                     return
                 try:
                     yield True
                 finally:
-                    current = await redis_client.get(key)
-                    if current == token:
-                        await redis_client.delete(key)
+                    try:
+                        current = await redis_client.get(key)
+                        if current == token:
+                            await redis_client.delete(key)
+                    except Exception:
+                        # Ignore release failures and let key expire by TTL.
+                        pass
                 return
-            except Exception:
-                # Redis unavailable: fallback to local lock.
-                pass
 
         local_lock = self._local_locks.setdefault(key, asyncio.Lock())
         if local_lock.locked():
