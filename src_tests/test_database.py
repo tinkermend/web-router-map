@@ -68,8 +68,7 @@ async def test_init_db_is_idempotent_and_extensions_exist():
                 "SELECT schema_name "
                 "FROM information_schema.schemata "
                 "WHERE schema_name = :schema"
-            ),
-            {"schema": settings.database_schema},
+            ).bindparams(schema=settings.database_schema)
         )
         assert schema_result.scalar_one_or_none() == settings.database_schema
 

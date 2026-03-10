@@ -8,6 +8,7 @@ from typing import AsyncIterator
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.config.settings import get_settings
@@ -105,11 +106,16 @@ async def ping_db() -> bool:
 async def init_db() -> None:
     """Initialize DB prerequisites in an idempotent way."""
 
+    # Ensure table metadata is registered before create_all.
+    from src.models import storage_state as _storage_state  # noqa: F401
+    from src.models import web_system as _web_system  # noqa: F401
+
     schema = _validated_schema(get_settings().database_schema)
     async with get_engine().begin() as conn:
         await conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
         await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "pgcrypto"'))
         await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "ltree"'))
+        await conn.run_sync(SQLModel.metadata.create_all)
 
 
 async def close_db() -> None:

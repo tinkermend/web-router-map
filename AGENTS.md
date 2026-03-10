@@ -19,3 +19,7 @@
   - React 环境: 探测 React DevTools 暴露的全局钩子 **REACT_DEVTOOLS_GLOBAL_HOOK** 或根节点 \_reactRootContainer，解析其 Fiber 树提取内部定义的 Routes。
 
 - DOM 仿真抓取识别 (降级兜底方案): 对于路由被高度混淆或无法直接反射的系统，通过 Playwright 定位侧边栏 (aside, nav, menu 等高频标签)，进行递归点击展开，并监听 URL 变化与 DOM 渲染，动态生成路径数。
+
+## 强制约束
+
+- 每次开发完成进行单元测试
