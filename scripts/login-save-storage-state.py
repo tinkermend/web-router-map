@@ -14,6 +14,7 @@ import argparse
 import json
 import random
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import ddddocr
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -46,7 +47,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--auth-output",
         default=DEFAULT_AUTH_OUTPUT_PATH,
-        help="Output file path for extracted Authorization/session/local storage info.",
+        help=(
+            "Output file path for extracted browser reuse payload "
+            "(cookies/local_storage/session_storage/request_headers)."
+        ),
     )
     parser.add_argument(
         "--headed",
@@ -176,6 +180,33 @@ def _read_web_storage(page, storage_name: str) -> dict[str, str]:
     )
 
 
+def _get_origin(url: str) -> str:
+    parsed = urlsplit(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _normalize_request_headers(headers: dict[str, str]) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for key, value in headers.items():
+        if not value:
+            continue
+        normalized[key.lower()] = value
+    return normalized
+
+
+def _is_auth_related_request(headers: dict[str, str]) -> bool:
+    auth_keys = {
+        "authorization",
+        "cookie",
+        "x-csrf-token",
+        "x-xsrf-token",
+        "x-auth-token",
+        "token",
+        "access-token",
+    }
+    return any(key in headers for key in auth_keys)
+
+
 def main() -> None:
     args = parse_args()
     storage_state_path = Path(args.storage_state).resolve()
@@ -189,14 +220,33 @@ def main() -> None:
         context.set_default_timeout(args.timeout_ms)
         page = context.new_page()
         page.set_default_timeout(args.timeout_ms)
-        auth_header_capture: dict[str, str | None] = {"authorization": None}
+        expected_origin = _get_origin(LOGIN_URL)
+        request_capture: dict[str, dict[str, str] | str | None] = {
+            "authorization": None,
+            "request_headers": None,
+        }
 
         def _on_request(request) -> None:
-            if auth_header_capture["authorization"]:
+            if _get_origin(request.url) != expected_origin:
                 return
-            auth = request.headers.get("authorization")
-            if auth:
-                auth_header_capture["authorization"] = auth
+
+            headers = _normalize_request_headers(dict(request.headers))
+            if not headers:
+                return
+
+            is_auth_related = _is_auth_related_request(headers)
+            is_api_like = request.resource_type in {"xhr", "fetch"}
+
+            # Prefer requests carrying auth-related headers. If none appears,
+            # fallback to the first same-origin API-like request headers.
+            if is_auth_related:
+                request_capture["request_headers"] = headers
+                request_capture["authorization"] = headers.get("authorization")
+                return
+
+            if request_capture["request_headers"] is None and is_api_like:
+                request_capture["request_headers"] = headers
+                request_capture["authorization"] = headers.get("authorization")
 
         page.on("request", _on_request)
 
@@ -213,13 +263,16 @@ def main() -> None:
             _wait_login_success(page, args.timeout_ms)
             page.wait_for_timeout(1500)
 
-            context.storage_state(path=str(storage_state_path))
+            storage_state = context.storage_state(path=str(storage_state_path))
+            cookies = storage_state.get("cookies", []) if isinstance(storage_state, dict) else []
             local_storage = _read_web_storage(page, "localStorage")
             session_storage = _read_web_storage(page, "sessionStorage")
             auth_payload = {
                 "base_url": LOGIN_URL,
                 "current_url": page.url,
-                "authorization": auth_header_capture["authorization"],
+                "authorization": request_capture["authorization"],
+                "request_headers": request_capture["request_headers"] or {},
+                "cookies": cookies,
                 "local_storage": local_storage,
                 "session_storage": session_storage,
             }
@@ -229,10 +282,16 @@ def main() -> None:
 
             print(f"StorageState saved: {storage_state_path}")
             print(f"Auth info saved: {auth_output_path}")
-            if auth_header_capture["authorization"]:
+            if request_capture["authorization"]:
                 print("Authorization header captured: yes")
             else:
                 print("Authorization header captured: no")
+            print(f"Cookies captured: {len(cookies)}")
+            print(f"localStorage keys captured: {len(local_storage)}")
+            print(f"sessionStorage keys captured: {len(session_storage)}")
+            print(
+                f"request_headers captured: {len(auth_payload['request_headers'])}"
+            )
             print(f"Current URL: {page.url}")
         finally:
             browser.close()
