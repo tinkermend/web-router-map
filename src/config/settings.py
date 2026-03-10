@@ -2,21 +2,10 @@
 
 from __future__ import annotations
 
-import base64
 from functools import lru_cache
-from hashlib import sha256
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-def _build_default_encryption_key() -> str:
-    """Return url-safe base64 encoded 32-byte key for AES-256-GCM."""
-
-    digest = sha256(b"web-router-map-dev-encryption-key").digest()
-    return base64.urlsafe_b64encode(digest).decode("ascii")
-
-
 class Settings(BaseSettings):
     """Global application settings sourced from environment variables."""
 
@@ -63,7 +52,7 @@ class Settings(BaseSettings):
     default_crawl_cron: str = Field(default="0 2 * * *", validation_alias="DEFAULT_CRAWL_CRON")
 
     # Security
-    encryption_key: str = Field(default_factory=_build_default_encryption_key, validation_alias="ENCRYPTION_KEY")
+    encryption_key: str = Field(min_length=1, validation_alias="ENCRYPTION_KEY")
 
     # Monitoring
     sentry_dsn: str | None = Field(default=None, validation_alias="SENTRY_DSN")

@@ -8,7 +8,9 @@ from src.models.database import close_db, get_session_factory, init_db, ping_db,
 
 
 @pytest.fixture(autouse=True)
-async def _cleanup_singletons():
+async def _cleanup_singletons(monkeypatch):
+    monkeypatch.setenv("ENCRYPTION_KEY", "test-db-encryption-key")
+    get_settings.cache_clear()
     yield
     await close_db()
     get_settings.cache_clear()

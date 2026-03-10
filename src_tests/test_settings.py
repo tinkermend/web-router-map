@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from src.config.settings import get_settings
 
 
@@ -37,6 +40,7 @@ def test_settings_defaults(monkeypatch) -> None:
     monkeypatch.setenv("AUTH_RETRY_DELAY_SECONDS", "5")
     monkeypatch.setenv("SCHEDULER_ENABLED", "false")
     monkeypatch.setenv("DEFAULT_AUTH_CRON", "0 */6 * * *")
+    monkeypatch.setenv("ENCRYPTION_KEY", "test-default-encryption-key")
     monkeypatch.setenv("DEBUG", "false")
     get_settings.cache_clear()
 
@@ -57,7 +61,7 @@ def test_settings_defaults(monkeypatch) -> None:
     assert settings.auth_retry_delay_seconds == 5
     assert settings.scheduler_enabled is False
     assert settings.default_auth_cron == "0 */6 * * *"
-    assert isinstance(settings.encryption_key, str) and settings.encryption_key
+    assert settings.encryption_key == "test-default-encryption-key"
     assert settings.debug is False
 
 
@@ -102,3 +106,12 @@ def test_settings_env_override(monkeypatch) -> None:
     assert settings.default_auth_cron == "*/10 * * * *"
     assert settings.encryption_key == "secret-key"
     assert settings.debug is True
+
+
+def test_settings_requires_encryption_key(monkeypatch) -> None:
+    _clear_database_env(monkeypatch)
+    monkeypatch.setenv("ENCRYPTION_KEY", "")
+    get_settings.cache_clear()
+
+    with pytest.raises(ValidationError):
+        get_settings()

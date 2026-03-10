@@ -8,8 +8,10 @@ from src.infrastructure.redis_client import RedisClient
 from src.infrastructure.sentry_client import init_sentry
 
 
-async def test_infrastructure():
+async def test_infrastructure(monkeypatch):
     """Test infrastructure components."""
+    monkeypatch.setenv("ENCRYPTION_KEY", "test-infra-encryption-key")
+    get_settings.cache_clear()
     settings = get_settings()
 
     # Test logging
