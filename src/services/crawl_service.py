@@ -17,7 +17,6 @@ from sqlmodel import desc, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.models.app_page import AppPage
-from src.models.crawl_log import CrawlLog
 from src.models.nav_menu import NavMenu
 from src.models.storage_state import StorageState
 from src.models.ui_container import UIContainer
@@ -25,6 +24,7 @@ from src.models.ui_element import UIElement
 from src.models.web_system import WebSystem
 from src.scheduler.locks import distributed_lock
 from src.services.auth_service import AuthService
+from src.services.task_tracker import TaskTracker
 
 DEFAULT_HOME_PATH = "#/analytics"
 DEFAULT_MAX_PAGES = 10
@@ -56,6 +56,7 @@ class CrawlService:
 
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+        self.task_tracker = TaskTracker(session)
 
     async def run_by_sys_code(
         self,
@@ -71,6 +72,7 @@ class CrawlService:
         home_url: str = "",
     ) -> CrawlRunResult:
         started_at = _utc_now()
+        task_log_id: UUID | None = None
         system = await self._get_active_system(sys_code)
         if system is None:
             finished_at = _utc_now()
@@ -88,15 +90,28 @@ class CrawlService:
                 finished_at=finished_at,
             )
 
+        task_log = await self.task_tracker.start(
+            system_id=system.id,
+            task_type="crawl_menu",
+            target_url=home_url or self._default_home_url(system),
+        )
+        task_log_id = task_log.id
+
         state = await self._get_valid_state(system)
         if state is None:
             auth_result = await AuthService(self.session).refresh_by_sys_code(sys_code)
             finished_at = _utc_now()
+            await self.task_tracker.finish(
+                log_id=task_log_id,
+                status="skipped",
+                error_message=f"No valid state. Auth refresh result: {auth_result.status}",
+                retry_count=0,
+            )
             return CrawlRunResult(
                 sys_code=sys_code,
                 status="auth_triggered",
                 message=f"No valid state. Auth refresh result: {auth_result.status}",
-                crawl_log_id=None,
+                crawl_log_id=task_log_id,
                 auth_triggered=True,
                 menus_saved=0,
                 pages_saved=0,
@@ -110,11 +125,17 @@ class CrawlService:
         async with distributed_lock.acquire(lock_name) as acquired:
             if not acquired:
                 finished_at = _utc_now()
+                await self.task_tracker.finish(
+                    log_id=task_log_id,
+                    status="skipped",
+                    error_message="Crawl task is already running.",
+                    retry_count=0,
+                )
                 return CrawlRunResult(
                     sys_code=sys_code,
                     status="skipped",
                     message="Crawl task is already running.",
-                    crawl_log_id=None,
+                    crawl_log_id=task_log_id,
                     auth_triggered=False,
                     menus_saved=0,
                     pages_saved=0,
@@ -123,18 +144,6 @@ class CrawlService:
                     started_at=started_at,
                     finished_at=finished_at,
                 )
-
-            crawl_log = CrawlLog(
-                system_id=system.id,
-                task_type="crawl_menu",
-                task_id=str(uuid4()),
-                status="running",
-                target_url=home_url or self._default_home_url(system),
-                started_at=started_at,
-                retry_count=0,
-            )
-            self.session.add(crawl_log)
-            await self.session.commit()
 
             output_path: Path | None = None
             try:
@@ -154,18 +163,18 @@ class CrawlService:
 
                 if not bool(payload.get("meta", {}).get("state_valid")):
                     auth_result = await AuthService(self.session).refresh_by_sys_code(sys_code)
-                    crawl_log.status = "skipped"
-                    crawl_log.error_message = f"state invalid in crawler; auth refresh={auth_result.status}"
-                    crawl_log.finished_at = _utc_now()
-                    crawl_log.duration_ms = int((crawl_log.finished_at - started_at).total_seconds() * 1000)
-                    await self.session.commit()
-
+                    await self.task_tracker.finish(
+                        log_id=task_log_id,
+                        status="skipped",
+                        error_message=f"state invalid in crawler; auth refresh={auth_result.status}",
+                        retry_count=0,
+                    )
                     finished_at = _utc_now()
                     return CrawlRunResult(
                         sys_code=sys_code,
                         status="auth_triggered",
                         message="State invalid during crawl. Triggered auth refresh.",
-                        crawl_log_id=crawl_log.id,
+                        crawl_log_id=task_log_id,
                         auth_triggered=True,
                         menus_saved=0,
                         pages_saved=0,
@@ -182,20 +191,22 @@ class CrawlService:
                     .where(WebSystem.id == system.id)
                     .values(last_crawl_at=now, updated_at=now)
                 )
-
-                crawl_log.status = "success"
-                crawl_log.pages_found = save_result["pages_saved"]
-                crawl_log.elements_found = save_result["elements_saved"]
-                crawl_log.finished_at = now
-                crawl_log.duration_ms = int((now - started_at).total_seconds() * 1000)
                 await self.session.commit()
+
+                await self.task_tracker.finish(
+                    log_id=task_log_id,
+                    status="success",
+                    retry_count=0,
+                    pages_found=save_result["pages_saved"],
+                    elements_found=save_result["elements_saved"],
+                )
 
                 finished_at = _utc_now()
                 return CrawlRunResult(
                     sys_code=sys_code,
                     status="success",
                     message="Menu map crawl and persistence completed.",
-                    crawl_log_id=crawl_log.id,
+                    crawl_log_id=task_log_id,
                     auth_triggered=False,
                     menus_saved=save_result["menus_saved"],
                     pages_saved=save_result["pages_saved"],
@@ -206,17 +217,18 @@ class CrawlService:
                 )
             except Exception as exc:
                 await self.session.rollback()
+                await self.task_tracker.finish(
+                    log_id=task_log_id,
+                    status="failed",
+                    error_message=str(exc),
+                    retry_count=0,
+                )
                 finished_at = _utc_now()
-                crawl_log.status = "failed"
-                crawl_log.error_message = str(exc)
-                crawl_log.finished_at = finished_at
-                crawl_log.duration_ms = int((finished_at - started_at).total_seconds() * 1000)
-                await self.session.commit()
                 return CrawlRunResult(
                     sys_code=sys_code,
                     status="failed",
                     message=f"Crawl failed: {exc}",
-                    crawl_log_id=crawl_log.id,
+                    crawl_log_id=task_log_id,
                     auth_triggered=False,
                     menus_saved=0,
                     pages_saved=0,

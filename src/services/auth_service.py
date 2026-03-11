@@ -19,6 +19,7 @@ from src.models.storage_state import StorageState
 from src.models.web_system import WebSystem
 from src.scheduler.locks import distributed_lock
 from src.services.crypto_service import CryptoService
+from src.services.task_tracker import TaskTracker
 from src.services.validator_service import ValidationResult, validate_capture
 
 AUTH_COOKIE_KEYS = {"session", "sessionid", "jsessionid", "token", "auth", "access_token"}
@@ -63,6 +64,7 @@ class AuthService:
         self.settings = settings
         self.crawler = AuthCrawler()
         self.crypto = CryptoService(settings.encryption_key)
+        self.task_tracker = TaskTracker(session)
 
     async def refresh_by_sys_code(
         self,
@@ -72,6 +74,7 @@ class AuthService:
         timeout_ms: int | None = None,
     ) -> AuthRefreshResult:
         started_at = _utc_now()
+        task_log_id: UUID | None = None
         system = await self._get_active_system(sys_code)
         if system is None:
             finished_at = _utc_now()
@@ -90,10 +93,23 @@ class AuthService:
                 finished_at=finished_at,
             )
 
+        task_log = await self.task_tracker.start(
+            system_id=system.id,
+            task_type="auth",
+            target_url=system.login_url or system.base_url,
+        )
+        task_log_id = task_log.id
+
         username = self._resolve_secret(system.login_username)
         password = self._resolve_secret(system.login_password)
         if not username or not password:
             finished_at = _utc_now()
+            await self.task_tracker.finish(
+                log_id=task_log_id,
+                status="failed",
+                error_message="Missing login credentials in web_systems.",
+                retry_count=0,
+            )
             return AuthRefreshResult(
                 sys_code=sys_code,
                 status="failed",
@@ -115,6 +131,12 @@ class AuthService:
         async with distributed_lock.acquire(lock_name) as acquired:
             if not acquired:
                 finished_at = _utc_now()
+                await self.task_tracker.finish(
+                    log_id=task_log_id,
+                    status="skipped",
+                    error_message="Auth refresh lock is already held by another task.",
+                    retry_count=0,
+                )
                 return AuthRefreshResult(
                     sys_code=sys_code,
                     status="skipped",
@@ -158,6 +180,11 @@ class AuthService:
 
                     state_id = await self._save_state(system, capture, analysis, validation)
                     finished_at = _utc_now()
+                    await self.task_tracker.finish(
+                        log_id=task_log_id,
+                        status="success",
+                        retry_count=max(0, attempt - 1),
+                    )
                     return AuthRefreshResult(
                         sys_code=sys_code,
                         status="success",
@@ -179,6 +206,12 @@ class AuthService:
                         await asyncio.sleep(self.settings.auth_retry_delay_seconds)
 
             finished_at = _utc_now()
+            await self.task_tracker.finish(
+                log_id=task_log_id,
+                status="failed",
+                error_message=f"Auth refresh failed after retries: {last_error}",
+                retry_count=max(0, self.settings.auth_max_retries - 1),
+            )
             return AuthRefreshResult(
                 sys_code=sys_code,
                 status="failed",

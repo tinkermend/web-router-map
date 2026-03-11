@@ -62,6 +62,7 @@
   - `POST /api/auth/refresh/{sys_code}`: 触发登录并更新 `storage_states`
   - `GET /api/auth/state/{sys_code}`: 查询当前有效状态
   - `POST /api/auth/manual-state/{sys_code}`: 手动注入状态快照
+  - `GET /api/tasks/{sys_code}/logs`: 查询认证/采集任务状态历史
 - CLI:
   - `python scripts/refresh-storage-state.py --sys-code ele.vben.pro --headed`
 

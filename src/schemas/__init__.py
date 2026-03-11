@@ -7,6 +7,7 @@ from src.schemas.auth import (
     ManualStatePayload,
 )
 from src.schemas.crawl import CrawlRunRequest, CrawlRunResponse
+from src.schemas.task_log import TaskLogItem, TaskLogListResponse
 
 __all__ = [
     "AuthRefreshRequest",
@@ -15,4 +16,6 @@ __all__ = [
     "CrawlRunResponse",
     "LatestStateResponse",
     "ManualStatePayload",
+    "TaskLogItem",
+    "TaskLogListResponse",
 ]
