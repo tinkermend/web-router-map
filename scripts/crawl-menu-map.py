@@ -157,6 +157,42 @@ def _to_route_path(url_or_path: str) -> str | None:
     return None
 
 
+def _route_path_from_menu_hint(value: Any) -> str | None:
+    text = _normalize_text(str(value or ""))
+    if not text:
+        return None
+    lower = text.lower()
+    if lower.startswith("javascript:") or lower.startswith("mailto:") or lower.startswith("tel:"):
+        return None
+
+    if text.startswith("http://") or text.startswith("https://"):
+        route_path = _to_route_path(text)
+        if route_path:
+            return route_path
+        parsed = urlsplit(text)
+        if parsed.path and parsed.path != "/":
+            return parsed.path
+        return None
+
+    if text.startswith("#/"):
+        return "/" + text[2:].lstrip("/")
+    if text.startswith("/"):
+        return text
+
+    if re.fullmatch(r"\d+(?:[-_.:]\d+)*", text):
+        return None
+    if text.startswith("?") or text.startswith("#"):
+        return None
+
+    cleaned = text[2:] if text.startswith("./") else text
+    cleaned = cleaned.lstrip("/")
+    if not cleaned or cleaned.startswith("../"):
+        return None
+    if re.search(r"\s", cleaned):
+        return None
+    return f"/{cleaned}"
+
+
 def _build_url_from_route(origin: str, home_url: str, route_path: str | None) -> str | None:
     if not route_path:
         return None
@@ -175,28 +211,10 @@ def _is_state_valid(page, validate_url: str, timeout_ms: int) -> bool:
     except PlaywrightTimeoutError:
         return False
 
-    url = page.url
-    if "#/auth/login" in url or "/auth/login" in url:
+    url = (page.url or "").lower()
+    if "#/auth/login" in url or "/auth/login" in url or "#/login" in url or "/login" in url:
         return False
-
-    login_ui_visible = page.evaluate(
-        """() => {
-            const selectors = [
-                'input[placeholder*="用户名"]',
-                'input[placeholder*="密码"]',
-                'button[type="submit"]',
-                '[class*="login"] button',
-            ];
-            return selectors.some((sel) => {
-                const node = document.querySelector(sel);
-                if (!node) return false;
-                const rect = node.getBoundingClientRect();
-                const style = window.getComputedStyle(node);
-                return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-            });
-        }"""
-    )
-    return not bool(login_ui_visible)
+    return True
 
 
 def _apply_saved_web_storage(page, origin: str, local_storage: dict[str, str], session_storage: dict[str, str], timeout_ms: int) -> None:
@@ -446,9 +464,12 @@ def _extract_menu_nodes_from_dom(page, origin: str, menu_selector: str) -> dict[
             candidates.push(
                 'aside nav',
                 'aside .ant-menu',
+                'aside .el-menu',
                 'aside',
                 '.ant-layout-sider .ant-menu',
                 '.vben-admin-layout .ant-menu',
+                '.el-aside .el-menu',
+                '.el-menu',
                 '[role=\"navigation\"]',
                 'nav'
             );
@@ -513,87 +534,92 @@ def _extract_menu_nodes_from_dom(page, origin: str, menu_selector: str) -> dict[
                 return Array.from(container.querySelectorAll(':scope > ul > li'));
             };
 
-            let root = null;
             for (const sel of candidates) {
-                const found = document.querySelector(sel);
-                if (found) {
-                    root = found;
+                const root = document.querySelector(sel);
+                if (!root) continue;
+                if (!result.root_selector) result.root_selector = sel;
+
+                const topContainer = root.matches('ul') ? root : (root.querySelector('ul') || root);
+                const nodes = [];
+
+                const walk = (container, parentKey, depth, pathIndexes, breadcrumb) => {
+                    const items = directChildLis(container);
+                    items.forEach((li, idx) => {
+                        if (!visible(li)) return;
+                        const title = pickTitle(li);
+                        if (!title) return;
+                        const hrefNode = li.querySelector('a[href]');
+                        const href = hrefNode ? hrefNode.getAttribute('href') || '' : '';
+                        const hasChildren = li.classList.contains('ant-menu-submenu') || !!li.querySelector(':scope > ul > li');
+                        const nodeType = hasChildren ? 'folder' : 'page';
+
+                        let routePath = null;
+                        let targetUrl = null;
+                        if (href) {
+                            if (href.startsWith('#/')) routePath = '/' + href.slice(2);
+                            else if (href.startsWith('/')) routePath = href;
+                            else if (href.startsWith('http://') || href.startsWith('https://')) {
+                                targetUrl = href;
+                                const hashIdx = href.indexOf('#/');
+                                if (hashIdx >= 0) routePath = '/' + href.slice(hashIdx + 2);
+                            }
+                        }
+                        const routeHint = (li.getAttribute('index') || li.getAttribute('data-index') || '').trim();
+                        if (!routePath) {
+                            if (routeHint.startsWith('#/')) routePath = '/' + routeHint.slice(2);
+                            else if (routeHint.startsWith('/')) routePath = routeHint;
+                        }
+
+                        if (!targetUrl && routePath) {
+                            targetUrl = `${origin}/#${routePath}`;
+                        }
+
+                        const nextPath = pathIndexes.concat(idx);
+                        const nodeKey = nextPath.join('.');
+                        const nextBreadcrumb = breadcrumb.concat(title);
+                        const textBreadcrumb = nextBreadcrumb.join(' > ');
+                        const roleNode = li.querySelector('[role=\"menuitem\"]');
+                        const locatorName = title.replace(/'/g, \"\\\\'\");
+                        const playwrightLocator = roleNode
+                            ? `get_by_role('menuitem', name='${locatorName}')`
+                            : `get_by_text('${locatorName}')`;
+
+                        nodes.push({
+                            node_id: nodeKey,
+                            parent_id: parentKey,
+                            title,
+                            text_breadcrumb: textBreadcrumb,
+                            menu_order: idx,
+                            menu_level: depth,
+                            path_indexes: nextPath,
+                            node_type: nodeType,
+                            target_url: targetUrl,
+                            route_path: routePath,
+                            route_hint: routeHint || null,
+                            route_name: null,
+                            playwright_locator: playwrightLocator,
+                            is_group: nodeType === 'folder',
+                            is_external: !!targetUrl && !targetUrl.startsWith(origin),
+                            is_visible: true,
+                            dom_css_path: cssPath(li),
+                            source: 'dom',
+                        });
+
+                        const childContainer = li.querySelector(':scope > ul');
+                        if (childContainer) {
+                            walk(childContainer, nodeKey, depth + 1, nextPath, nextBreadcrumb);
+                        }
+                    });
+                };
+
+                walk(topContainer, null, 1, [], []);
+                if (nodes.length > 0) {
+                    result.nodes = nodes;
+                    result.success = true;
                     result.root_selector = sel;
-                    break;
+                    return result;
                 }
             }
-            if (!root) return result;
-
-            const topContainer = root.matches('ul') ? root : (root.querySelector('ul') || root);
-            const nodes = [];
-
-            const walk = (container, parentKey, depth, pathIndexes, breadcrumb) => {
-                const items = directChildLis(container);
-                items.forEach((li, idx) => {
-                    if (!visible(li)) return;
-                    const title = pickTitle(li);
-                    if (!title) return;
-                    const hrefNode = li.querySelector('a[href]');
-                    const href = hrefNode ? hrefNode.getAttribute('href') || '' : '';
-                    const hasChildren = li.classList.contains('ant-menu-submenu') || !!li.querySelector(':scope > ul > li');
-                    const nodeType = hasChildren ? 'folder' : 'page';
-
-                    let routePath = null;
-                    let targetUrl = null;
-                    if (href) {
-                        if (href.startsWith('#/')) routePath = '/' + href.slice(2);
-                        else if (href.startsWith('/')) routePath = href;
-                        else if (href.startsWith('http://') || href.startsWith('https://')) {
-                            targetUrl = href;
-                            const hashIdx = href.indexOf('#/');
-                            if (hashIdx >= 0) routePath = '/' + href.slice(hashIdx + 2);
-                        }
-                    }
-
-                    if (!targetUrl && routePath) {
-                        targetUrl = `${origin}/#${routePath}`;
-                    }
-
-                    const nextPath = pathIndexes.concat(idx);
-                    const nodeKey = nextPath.join('.');
-                    const nextBreadcrumb = breadcrumb.concat(title);
-                    const textBreadcrumb = nextBreadcrumb.join(' > ');
-                    const roleNode = li.querySelector('[role=\"menuitem\"]');
-                    const locatorName = title.replace(/'/g, \"\\\\'\");
-                    const playwrightLocator = roleNode
-                        ? `get_by_role('menuitem', name='${locatorName}')`
-                        : `get_by_text('${locatorName}')`;
-
-                    nodes.push({
-                        node_id: nodeKey,
-                        parent_id: parentKey,
-                        title,
-                        text_breadcrumb: textBreadcrumb,
-                        menu_order: idx,
-                        menu_level: depth,
-                        path_indexes: nextPath,
-                        node_type: nodeType,
-                        target_url: targetUrl,
-                        route_path: routePath,
-                        route_name: null,
-                        playwright_locator: playwrightLocator,
-                        is_group: nodeType === 'folder',
-                        is_external: !!targetUrl && !targetUrl.startsWith(origin),
-                        is_visible: true,
-                        dom_css_path: cssPath(li),
-                        source: 'dom',
-                    });
-
-                    const childContainer = li.querySelector(':scope > ul');
-                    if (childContainer) {
-                        walk(childContainer, nodeKey, depth + 1, nextPath, nextBreadcrumb);
-                    }
-                });
-            };
-
-            walk(topContainer, null, 1, [], []);
-            result.nodes = nodes;
-            result.success = nodes.length > 0;
             return result;
         }""",
         [origin, menu_selector],
@@ -1129,18 +1155,27 @@ def _build_menu_nodes(route_data: dict[str, Any], dom_data: dict[str, Any], orig
     route_map: dict[str, dict[str, Any]] = {}
 
     for route in route_data.get("routes", []):
-        rp = route.get("route_path")
+        rp = _route_path_from_menu_hint(route.get("route_path"))
         if not rp:
             continue
+        route["route_path"] = rp
+        if not route.get("target_url"):
+            route["target_url"] = _build_url_from_route(origin, home_url, rp)
         route_map[rp] = route
 
     for node in dom_data.get("nodes", []):
-        rp = node.get("route_path")
+        rp = _route_path_from_menu_hint(node.get("route_path")) or _route_path_from_menu_hint(
+            node.get("route_hint")
+        )
+        if rp:
+            node["route_path"] = rp
         route = route_map.get(rp or "")
         if route:
             node["route_name"] = route.get("route_name")
             if not node.get("target_url"):
                 node["target_url"] = route.get("target_url")
+        if not node.get("target_url"):
+            node["target_url"] = _build_url_from_route(origin, home_url, rp)
         nodes.append(node)
 
     # Console routes that are not found in DOM become virtual leaf nodes
@@ -1182,9 +1217,10 @@ def _build_menu_nodes(route_data: dict[str, Any], dom_data: dict[str, Any], orig
     return _merge_menu_nodes(nodes)
 
 
-def _build_url_queue(menu_nodes: list[dict[str, Any]], max_pages: int) -> list[str]:
+def _build_url_queue(menu_nodes: list[dict[str, Any]], max_pages: int, home_url: str) -> list[str]:
     queue: list[str] = []
     seen = set()
+    origin = _origin_of(home_url) if home_url else ""
     for node in menu_nodes:
         if node.get("node_type") != "page":
             continue
@@ -1195,6 +1231,8 @@ def _build_url_queue(menu_nodes: list[dict[str, Any]], max_pages: int) -> list[s
             continue
         target_url = node.get("target_url")
         if not target_url:
+            target_url = _build_url_from_route(origin, home_url, route_path)
+        if not target_url:
             continue
         if target_url in seen:
             continue
@@ -1202,6 +1240,8 @@ def _build_url_queue(menu_nodes: list[dict[str, Any]], max_pages: int) -> list[s
         queue.append(target_url)
         if len(queue) >= max_pages:
             break
+    if not queue and home_url:
+        queue.append(home_url)
     return queue
 
 
@@ -1279,7 +1319,7 @@ def main() -> None:
         dom_data = _extract_menu_nodes_from_dom(page, origin, args.menu_selector)
 
         menu_nodes = _build_menu_nodes(route_data, dom_data, origin, home_url)
-        url_queue = _build_url_queue(menu_nodes, args.max_pages)
+        url_queue = _build_url_queue(menu_nodes, args.max_pages, home_url)
 
         pages: list[dict[str, Any]] = []
         for url in url_queue:
