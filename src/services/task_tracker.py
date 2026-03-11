@@ -53,6 +53,7 @@ class TaskTracker:
         retry_count: int | None = None,
         error_message: str | None = None,
         error_stack: str | None = None,
+        changed: bool | None = None,
         pages_found: int | None = None,
         elements_found: int | None = None,
         sentry_event_id: str | None = None,
@@ -71,6 +72,8 @@ class TaskTracker:
             log.error_message = error_message
         if error_stack is not None:
             log.error_stack = error_stack
+        if changed is not None:
+            log.changed = changed
         if pages_found is not None:
             log.pages_found = pages_found
         if elements_found is not None:

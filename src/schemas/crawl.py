@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -19,6 +20,8 @@ class CrawlRunRequest(BaseModel):
     expand_rounds: int = 6
     menu_selector: str = ""
     home_url: str = ""
+    framework_hint: Literal["auto", "vue2", "vue3", "react"] = "auto"
+    strict_mode: bool = False
 
 
 class CrawlRunResponse(BaseModel):
@@ -35,3 +38,8 @@ class CrawlRunResponse(BaseModel):
     output_path: str | None
     started_at: datetime
     finished_at: datetime
+    quality_score: float | None = None
+    degraded: bool | None = None
+    degraded_reason: str | None = None
+    framework_detected: str | None = None
+    extractor_chain: list[str] | None = None

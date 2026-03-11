@@ -16,6 +16,7 @@ class TaskLogItem(BaseModel):
     retry_count: int | None
     target_url: str | None
     error_message: str | None
+    changed: bool | None
     pages_found: int | None
     elements_found: int | None
     duration_ms: int | None

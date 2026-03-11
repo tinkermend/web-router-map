@@ -61,6 +61,55 @@ class DummyPage:
         self.waits.append(milliseconds)
 
 
+class DummyWaitFunctionPage:
+    def __init__(self, *, url: str, should_timeout: bool = False) -> None:
+        self.url = url
+        self.should_timeout = should_timeout
+        self.calls: list[tuple[str, dict, int]] = []
+
+    async def wait_for_function(self, script: str, *, arg: dict | None = None, timeout: int | None = None) -> None:
+        self.calls.append((script, arg or {}, int(timeout or 0)))
+        if self.should_timeout:
+            raise ac.PlaywrightTimeoutError("Timeout 30000ms exceeded.")
+
+
+def test_build_login_wait_payload_hash_router():
+    payload = ac._build_login_wait_payload("https://demo.example.com/#/auth/login?redirect=/dashboard")
+    assert payload["expected_origin"] == "https://demo.example.com"
+    assert payload["login_path"] == ""
+    assert payload["login_fragment"] == "auth/login"
+    assert "access_token" in payload["token_keys"]
+    assert "sessionid" in payload["cookie_hints"]
+
+
+def test_build_login_wait_payload_path_router():
+    payload = ac._build_login_wait_payload("https://demo.example.com/login?redirect=%2Fdashboard")
+    assert payload["expected_origin"] == "https://demo.example.com"
+    assert payload["login_path"] == "/login"
+    assert payload["login_fragment"] == ""
+
+
+@pytest.mark.asyncio
+async def test_wait_login_success_uses_wait_for_function():
+    page = DummyWaitFunctionPage(url="https://demo.example.com/#/dashboard")
+    await ac._wait_login_success(page, 12_000, login_url="https://demo.example.com/#/auth/login")
+
+    assert len(page.calls) == 1
+    _, payload, timeout = page.calls[0]
+    assert timeout == 12_000
+    assert payload["login_fragment"] == "auth/login"
+
+
+@pytest.mark.asyncio
+async def test_wait_login_success_timeout_error_contains_debug_info():
+    page = DummyWaitFunctionPage(
+        url="https://demo.example.com/#/auth/login",
+        should_timeout=True,
+    )
+    with pytest.raises(RuntimeError, match="current_url=https://demo.example.com/#/auth/login"):
+        await ac._wait_login_success(page, 500, login_url="https://demo.example.com/#/auth/login")
+
+
 @pytest.mark.asyncio
 async def test_login_auth_dispatch_by_type(monkeypatch):
     calls: list[str] = []

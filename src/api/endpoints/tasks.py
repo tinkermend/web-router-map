@@ -49,6 +49,7 @@ async def get_task_logs(
                 retry_count=row.retry_count,
                 target_url=row.target_url,
                 error_message=row.error_message,
+                changed=row.changed,
                 pages_found=row.pages_found,
                 elements_found=row.elements_found,
                 duration_ms=row.duration_ms,

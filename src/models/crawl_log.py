@@ -23,6 +23,7 @@ class CrawlLog(SQLModel, table=True):
     target_url: str | None = Field(default=None, max_length=500)
     error_message: str | None = None
     error_stack: str | None = None
+    changed: bool | None = None
     pages_found: int | None = None
     elements_found: int | None = None
     duration_ms: int | None = None

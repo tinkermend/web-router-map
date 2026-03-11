@@ -8,7 +8,17 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import Column, DateTime, text
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.types import UserDefinedType
 from sqlmodel import Field, SQLModel
+
+
+class LtreeType(UserDefinedType):
+    """Minimal PostgreSQL ltree type for SQLAlchemy bindings."""
+
+    cache_ok = True
+
+    def get_col_spec(self, **_kw: Any) -> str:
+        return "LTREE"
 
 
 class NavMenu(SQLModel, table=True):
@@ -19,7 +29,7 @@ class NavMenu(SQLModel, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     system_id: UUID = Field(foreign_key="web_systems.id", index=True)
     parent_id: UUID | None = Field(default=None, foreign_key="nav_menus.id")
-    node_path: str | None = None
+    node_path: str | None = Field(default=None, sa_column=Column(LtreeType(), nullable=True))
     title: str = Field(max_length=255)
     text_breadcrumb: str | None = None
     icon: str | None = Field(default=None, max_length=128)

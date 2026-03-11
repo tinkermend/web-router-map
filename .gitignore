@@ -221,6 +221,8 @@ node_modules/
 logs/
 node_modules/
 test-results/
+src_tests/
+.Playwright-cli/
 tests/
 .qoder/
 .plan/

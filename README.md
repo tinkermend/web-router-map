@@ -41,13 +41,6 @@ uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 --workers 1
 - `password:` 123456
 - `auth:` 图形验证码
 
----
-
-- `name:` Vue Element Admin
-- `url:` https://panjiachen.github.io/vue-element-admin/#/login?redirect=%2Fdashboard
-- `account:` admin
-- `password:` 123456
-- `auth:` 无
 
 ---
 

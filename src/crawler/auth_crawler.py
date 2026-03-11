@@ -44,6 +44,14 @@ TOKEN_KEYS = (
     "authorization",
     "skillsflow:access_token",
 )
+COOKIE_KEY_HINTS = (
+    "session",
+    "sessionid",
+    "jsessionid",
+    "token",
+    "auth",
+    "access_token",
+)
 
 SUPPORTED_LOGIN_AUTH_TYPES = {
     "captcha_slider",
@@ -146,7 +154,7 @@ class AuthCrawler:
                 await _fill_username_password(page, login_selectors, username, password)
                 await _solve_login_challenge(page, login_auth, login_selectors, timeout_ms)
                 await _click_submit(page, login_selectors)
-                await _wait_login_success(page, timeout_ms)
+                await _wait_login_success(page, timeout_ms, login_url=login_url)
                 await page.wait_for_timeout(1500)
 
                 storage_state = await context.storage_state()
@@ -213,17 +221,77 @@ async def _read_web_storage(page: Page, storage_name: str) -> dict[str, str]:
     )
 
 
-async def _wait_login_success(page: Page, timeout_ms: int) -> None:
-    try:
-        await page.wait_for_url("**/analytics", timeout=timeout_ms)
-        return
-    except PlaywrightTimeoutError:
-        pass
+def _build_login_wait_payload(login_url: str) -> dict[str, Any]:
+    parsed = urlsplit(str(login_url or "").strip().lower())
+    fragment = (parsed.fragment or "").split("?", maxsplit=1)[0].strip().strip("/")
+    path = (parsed.path or "").strip().rstrip("/")
+    return {
+        "expected_origin": _get_origin(login_url).lower(),
+        "login_url": str(login_url or "").strip().lower(),
+        "login_path": path,
+        "login_fragment": fragment,
+        "token_keys": [key.lower() for key in TOKEN_KEYS],
+        "cookie_hints": [key.lower() for key in COOKIE_KEY_HINTS],
+    }
 
+
+async def _wait_login_success(page: Page, timeout_ms: int, *, login_url: str) -> None:
+    wait_script = """(args) => {
+        const href = String(window.location.href || "").toLowerCase();
+        const origin = String(window.location.origin || "").toLowerCase();
+        const expectedOrigin = String(args.expected_origin || "").toLowerCase();
+        const loginUrl = String(args.login_url || "").toLowerCase();
+        const loginPath = String(args.login_path || "").toLowerCase();
+        const loginFragment = String(args.login_fragment || "").toLowerCase();
+        const tokenKeys = Array.isArray(args.token_keys) ? args.token_keys : [];
+        const cookieHints = Array.isArray(args.cookie_hints) ? args.cookie_hints : [];
+
+        const sameOrigin = !expectedOrigin || origin === expectedOrigin;
+        const genericLoginPattern = /(^|[#/?&])login([/?&#]|$)/i;
+        const stillLoginPage =
+            (loginUrl && href.startsWith(loginUrl)) ||
+            (loginFragment && href.includes(loginFragment)) ||
+            (loginPath && loginPath !== "/" && href.includes(loginPath)) ||
+            href.includes("#/auth/login") ||
+            href.includes("/auth/login") ||
+            genericLoginPattern.test(href);
+
+        const awayFromLogin = sameOrigin && !stillLoginPage;
+
+        const hasStorageToken = [window.localStorage, window.sessionStorage].some((storage) => {
+            if (!storage) return false;
+            for (let i = 0; i < storage.length; i += 1) {
+                const key = String(storage.key(i) || "").toLowerCase();
+                if (!key) continue;
+                const value = String(storage.getItem(key) || "").trim();
+                if (!value) continue;
+                if (tokenKeys.includes(key)) return true;
+            }
+            return false;
+        });
+
+        const hasCookieSignal = (() => {
+            const cookieText = String(document.cookie || "");
+            if (!cookieText) return false;
+            const cookieNames = cookieText
+                .split(";")
+                .map((item) => item.split("=")[0])
+                .map((name) => String(name || "").trim().toLowerCase())
+                .filter(Boolean);
+            return cookieNames.some((name) =>
+                cookieHints.some((hint) => name === hint || name.endsWith(`_${hint}`) || name.endsWith(`-${hint}`))
+            );
+        })();
+
+        return awayFromLogin || (sameOrigin && (hasStorageToken || hasCookieSignal));
+    }"""
+    payload = _build_login_wait_payload(login_url)
     try:
-        await page.wait_for_url(lambda url: "#/auth/login" not in url, timeout=timeout_ms)
+        await page.wait_for_function(wait_script, arg=payload, timeout=timeout_ms)
     except PlaywrightTimeoutError as exc:
-        raise RuntimeError("Login did not redirect away from login page.") from exc
+        raise RuntimeError(
+            f"Login did not reach authenticated state within timeout. current_url={page.url}, login_url={login_url}"
+        ) from exc
 
 
 async def _solve_login_challenge(

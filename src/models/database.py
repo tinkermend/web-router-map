@@ -121,6 +121,7 @@ async def init_db() -> None:
         await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "pgcrypto"'))
         await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "ltree"'))
         await conn.run_sync(SQLModel.metadata.create_all)
+        await conn.execute(text(f'ALTER TABLE "{schema}"."crawl_logs" ADD COLUMN IF NOT EXISTS changed BOOLEAN'))
 
 
 async def close_db() -> None:

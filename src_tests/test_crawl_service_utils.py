@@ -3,11 +3,15 @@ from types import SimpleNamespace
 
 from src.services.crawl_service import (
     CrawlService,
+    _build_payload_fingerprint,
     _build_page_summary,
     _extract_page_keywords,
+    _extract_framework_detected,
     _infer_usage_description,
     _normalize_ltree_path,
     _normalize_authorization_value,
+    _normalize_extractor_chain,
+    _normalize_failure_categories,
     _parse_dt,
     _safe_str,
     _to_bool,
@@ -45,6 +49,16 @@ def test_route_path_extractor():
     assert CrawlService._route_path_from_url_pattern("https://a.com/#/analytics") == "/analytics"
     assert CrawlService._route_path_from_url_pattern("/system/menu") == "/system/menu"
     assert CrawlService._route_path_from_url_pattern("https://a.com/system/menu") is None
+
+
+def test_default_home_url_for_hash_router_keeps_hash_root():
+    system = SimpleNamespace(base_url="https://demo.gin-vue-admin.com/#/")
+    assert CrawlService._default_home_url(system) == "https://demo.gin-vue-admin.com/#/"
+
+
+def test_default_home_url_for_plain_origin_appends_default_path():
+    system = SimpleNamespace(base_url="https://ele.vben.pro")
+    assert CrawlService._default_home_url(system) == "https://ele.vben.pro/#/analytics"
 
 
 def test_ltree_path_normalization():
@@ -110,6 +124,20 @@ def test_validate_payload_before_overwrite():
         pass
 
 
+def test_meta_normalization_helpers():
+    meta = {
+        "framework_detection": {"framework_type": "vue3"},
+        "route_extraction": {"extractor_chain": ["vue3_runtime", "bundle_scripts", None, ""]},
+        "failure_categories": ["payload_low_confidence", "PAGE_CRAWL_PARTIAL", "payload_low_confidence"],
+    }
+    assert _extract_framework_detected(meta) == "vue3"
+    assert _normalize_extractor_chain(meta["route_extraction"]) == ["vue3_runtime", "bundle_scripts"]
+    assert _normalize_failure_categories(meta["failure_categories"]) == [
+        "payload_low_confidence",
+        "page_crawl_partial",
+    ]
+
+
 def test_normalize_authorization_value_and_resolve_state_authorization():
     assert _normalize_authorization_value("token-1", "Bearer") == "Bearer token-1"
     assert _normalize_authorization_value("Bearer token-1", "Bearer") == "Bearer token-1"
@@ -120,3 +148,119 @@ def test_normalize_authorization_value_and_resolve_state_authorization():
     encrypted = service.crypto.encrypt("token-2")
     state = SimpleNamespace(authorization_value=encrypted, authorization_schema="Bearer")
     assert service._resolve_state_authorization(state) == "Bearer token-2"
+
+
+def test_build_payload_fingerprint_ignores_order_and_volatile_fields():
+    payload_a = {
+        "meta": {"state_valid": True, "crawled_at": "2026-03-11T13:25:00Z"},
+        "menus": [
+            {
+                "title": "分析页",
+                "menu_order": 0,
+                "menu_level": 1,
+                "route_path": "/analytics",
+                "target_url": "https://a.com/#/analytics",
+                "path_indexes": [0],
+            },
+            {
+                "title": "系统管理",
+                "menu_order": 1,
+                "menu_level": 1,
+                "route_path": "/system",
+                "target_url": "https://a.com/#/system",
+                "path_indexes": [1],
+            },
+        ],
+        "pages": [
+            {
+                "url_pattern": "/analytics",
+                "target_url": "https://a.com/#/analytics",
+                "page_title": "分析",
+                "screenshot_path": "a/1.png",
+                "crawled_at": "2026-03-11T13:25:00Z",
+                "elements": [
+                    {
+                        "tag_name": "a",
+                        "element_type": "nav_link",
+                        "dom_css_path": "ul > li:nth-of-type(1) > a",
+                        "locator_tier": "text",
+                    },
+                ],
+            }
+        ],
+    }
+    payload_b = {
+        "meta": {"state_valid": True, "crawled_at": "2026-03-11T13:26:00Z"},
+        "menus": list(reversed(payload_a["menus"])),
+        "pages": [
+            {
+                "url_pattern": "/analytics",
+                "target_url": "https://a.com/#/analytics",
+                "page_title": "分析",
+                "screenshot_path": "a/2.png",
+                "crawled_at": "2026-03-11T13:26:00Z",
+                "elements": [
+                    {
+                        "tag_name": "a",
+                        "element_type": "nav_link",
+                        "dom_css_path": "ul > li:nth-of-type(9) > a",
+                        "locator_tier": "text",
+                    },
+                ],
+            }
+        ],
+    }
+
+    assert _build_payload_fingerprint(payload_a) == _build_payload_fingerprint(payload_b)
+
+
+def test_build_payload_fingerprint_detects_structural_change():
+    payload_a = {
+        "menus": [{"title": "分析页", "route_path": "/analytics", "target_url": "https://a.com/#/analytics"}],
+        "pages": [
+            {
+                "url_pattern": "/analytics",
+                "target_url": "https://a.com/#/analytics",
+                "elements": [{"tag_name": "button", "element_type": "action_btn", "dom_css_path": "div > button"}],
+            }
+        ],
+    }
+    payload_b = {
+        "menus": [{"title": "分析页", "route_path": "/analytics-v2", "target_url": "https://a.com/#/analytics-v2"}],
+        "pages": [
+            {
+                "url_pattern": "/analytics-v2",
+                "target_url": "https://a.com/#/analytics-v2",
+                "elements": [{"tag_name": "button", "element_type": "action_btn", "dom_css_path": "div > button"}],
+            }
+        ],
+    }
+
+    assert _build_payload_fingerprint(payload_a) != _build_payload_fingerprint(payload_b)
+
+
+def test_build_payload_fingerprint_detects_container_change():
+    payload_a = {
+        "menus": [{"title": "分析页", "route_path": "/analytics", "target_url": "https://a.com/#/analytics"}],
+        "pages": [
+            {
+                "url_pattern": "/analytics",
+                "target_url": "https://a.com/#/analytics",
+                "containers": [{"container_type": "modal", "css_selector": ".modal-a"}],
+                "elements": [{"tag_name": "button", "element_type": "action_btn", "dom_css_path": ".modal-a button"}],
+            }
+        ],
+    }
+    payload_b = {
+        "menus": [{"title": "分析页", "route_path": "/analytics", "target_url": "https://a.com/#/analytics"}],
+        "pages": [
+            {
+                "url_pattern": "/analytics",
+                "target_url": "https://a.com/#/analytics",
+                "containers": [{"container_type": "modal", "css_selector": ".modal-b"}],
+                "elements": [{"tag_name": "button", "element_type": "action_btn", "dom_css_path": ".modal-a button"}],
+            }
+        ],
+    }
+
+    assert _build_payload_fingerprint(payload_a) != _build_payload_fingerprint(payload_b)

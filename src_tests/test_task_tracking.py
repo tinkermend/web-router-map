@@ -381,3 +381,96 @@ async def test_crawl_service_writes_failed_task_log(monkeypatch):
     assert log.status == "failed"
     assert "crawl exploded" in (log.error_message or "")
     assert log.duration_ms is not None
+
+
+@pytest.mark.asyncio
+async def test_crawl_service_preserves_existing_snapshot_for_low_confidence_payload(tmp_path: Path, monkeypatch):
+    if not await ping_db():
+        pytest.skip("PostgreSQL is not reachable in current environment.")
+
+    system = await _create_system(with_credentials=True)
+    await _create_valid_state(system.id)
+    payload = {
+        "meta": {
+            "state_valid": True,
+            "coverage_score": 0.2,
+            "failure_categories": ["payload_low_confidence"],
+            "framework_detection": {"framework_type": "react"},
+            "route_extraction": {"extractor_chain": ["react_runtime", "bundle_scripts"]},
+        },
+        "menus": [{"title": "分析页", "route_path": "/analytics", "target_url": "https://example.com/#/analytics"}],
+        "pages": [{"url_pattern": "/analytics", "target_url": "https://example.com/#/analytics", "elements": []}],
+    }
+
+    async with session_scope() as session:
+        service = CrawlService(session)
+
+        async def fake_run_crawler_script(**_kwargs):
+            output = tmp_path / "crawl-output-low-confidence.json"
+            output.write_text(json.dumps(payload), encoding="utf-8")
+            return output
+
+        async def fake_existing_fp(_system_id):
+            return "existing-fp"
+
+        async def fake_snapshot_counts(_system_id):
+            return {"menus": 7, "pages": 3, "elements": 28}
+
+        async def fake_persist_payload(*_args, **_kwargs):
+            raise AssertionError("_persist_payload should not run for low-confidence overwrite guard")
+
+        monkeypatch.setattr(service, "_run_crawler_script", fake_run_crawler_script)
+        monkeypatch.setattr(service, "_build_existing_snapshot_fingerprint", fake_existing_fp)
+        monkeypatch.setattr(service, "_current_snapshot_counts", fake_snapshot_counts)
+        monkeypatch.setattr(service, "_persist_payload", fake_persist_payload)
+
+        result = await service.run_by_sys_code(system.sys_code)
+
+    assert result.status == "success"
+    assert result.degraded is True
+    assert result.quality_score == 0.2
+    assert result.framework_detected == "react"
+    assert result.extractor_chain == ["react_runtime", "bundle_scripts"]
+    assert result.failure_categories == ["payload_low_confidence"]
+    assert "Preserved existing snapshot" in result.message
+
+
+@pytest.mark.asyncio
+async def test_crawl_service_strict_mode_fails_low_confidence_payload(tmp_path: Path, monkeypatch):
+    if not await ping_db():
+        pytest.skip("PostgreSQL is not reachable in current environment.")
+
+    system = await _create_system(with_credentials=True)
+    await _create_valid_state(system.id)
+    payload = {
+        "meta": {
+            "state_valid": True,
+            "coverage_score": 0.1,
+            "failure_categories": ["payload_low_confidence"],
+            "framework_detection": {"framework_type": "vue2"},
+            "route_extraction": {"extractor_chain": ["vue2_runtime"]},
+        },
+        "menus": [{"title": "系统管理", "route_path": "/system", "target_url": "https://example.com/#/system"}],
+        "pages": [{"url_pattern": "/system", "target_url": "https://example.com/#/system", "elements": []}],
+    }
+
+    async with session_scope() as session:
+        service = CrawlService(session)
+
+        async def fake_run_crawler_script(**_kwargs):
+            output = tmp_path / "crawl-output-strict-low-confidence.json"
+            output.write_text(json.dumps(payload), encoding="utf-8")
+            return output
+
+        async def fake_persist_payload(*_args, **_kwargs):
+            raise AssertionError("_persist_payload should not run in strict low-confidence flow")
+
+        monkeypatch.setattr(service, "_run_crawler_script", fake_run_crawler_script)
+        monkeypatch.setattr(service, "_persist_payload", fake_persist_payload)
+
+        result = await service.run_by_sys_code(system.sys_code, strict_mode=True)
+
+    assert result.status == "failed"
+    assert result.degraded is True
+    assert result.quality_score == 0.1
+    assert "Strict mode rejected" in result.message

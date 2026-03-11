@@ -29,5 +29,7 @@ async def run_menu_crawl(
         expand_rounds=req.expand_rounds,
         menu_selector=req.menu_selector,
         home_url=req.home_url,
+        framework_hint=req.framework_hint,
+        strict_mode=req.strict_mode,
     )
     return CrawlRunResponse(**result.__dict__)

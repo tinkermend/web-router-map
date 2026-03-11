@@ -80,6 +80,7 @@ async def _create_system_with_logs() -> tuple[WebSystem, list[CrawlLog]]:
                 task_id="crawl-1",
                 status="success",
                 retry_count=0,
+                changed=True,
                 pages_found=5,
                 elements_found=50,
                 started_at=now - timedelta(minutes=1),
@@ -121,6 +122,7 @@ async def test_tasks_logs_api_filters_and_limits():
     assert len(body["items"]) == 1
     assert body["items"][0]["task_type"] == "auth"
     assert body["items"][0]["status"] == "failed"
+    assert body["items"][0]["changed"] is None
 
 
 @pytest.mark.asyncio
@@ -145,6 +147,8 @@ async def test_tasks_logs_api_sorted_by_started_at_desc():
     first = body["items"][0]["started_at"]
     second = body["items"][1]["started_at"]
     assert first >= second
+    assert body["items"][0]["task_type"] == "crawl_menu"
+    assert body["items"][0]["changed"] is True
 
 
 @pytest.mark.asyncio

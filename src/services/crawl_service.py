@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import subprocess
 import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, text, update
+from sqlalchemy import delete, func, text, update
 from sqlmodel import desc, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -36,6 +38,7 @@ DEFAULT_MAX_ELEMENTS_PER_PAGE = 180
 DEFAULT_MAX_MODAL_TRIGGERS = 8
 DEFAULT_EXPAND_ROUNDS = 6
 DEFAULT_TIMEOUT_MS = 45_000
+LOW_CONFIDENCE_THRESHOLD = 0.35
 service_logger = get_logger(__name__)
 
 
@@ -54,6 +57,12 @@ class CrawlRunResult:
     output_path: str | None
     started_at: datetime
     finished_at: datetime
+    quality_score: float | None = None
+    degraded: bool | None = None
+    degraded_reason: str | None = None
+    framework_detected: str | None = None
+    extractor_chain: list[str] | None = None
+    failure_categories: list[str] | None = None
 
 
 class CrawlService:
@@ -76,6 +85,8 @@ class CrawlService:
         expand_rounds: int = DEFAULT_EXPAND_ROUNDS,
         menu_selector: str = "",
         home_url: str = "",
+        framework_hint: str = "auto",
+        strict_mode: bool = False,
     ) -> CrawlRunResult:
         started_at = _utc_now()
         task_log_id: UUID | None = None
@@ -177,9 +188,28 @@ class CrawlService:
                     expand_rounds=expand_rounds,
                     menu_selector=menu_selector,
                     home_url=home_url or self._default_home_url(system),
+                    framework_hint=framework_hint,
                 )
                 payload = json.loads(output_path.read_text(encoding="utf-8"))
                 crawl_logger.bind(output_path=str(output_path)).info("Crawler script finished and output loaded")
+
+                payload_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+                quality_score = _to_float(payload_meta.get("coverage_score"))
+                failure_categories = _normalize_failure_categories(payload_meta.get("failure_categories"))
+                degraded = _to_bool(payload_meta.get("degraded"))
+                if degraded is None:
+                    degraded = False
+                degraded = bool(degraded or ("payload_low_confidence" in failure_categories))
+                degraded_reason = _safe_str(payload_meta.get("degraded_reason"), 255)
+                framework_detected = _extract_framework_detected(payload_meta)
+                extractor_chain = _normalize_extractor_chain(payload_meta.get("route_extraction"))
+                if quality_score is not None and quality_score < LOW_CONFIDENCE_THRESHOLD:
+                    if "payload_low_confidence" not in failure_categories:
+                        failure_categories.append("payload_low_confidence")
+                    degraded = True
+                    if not degraded_reason:
+                        degraded_reason = "payload_low_confidence"
+                low_confidence = "payload_low_confidence" in failure_categories
 
                 if not bool(payload.get("meta", {}).get("state_valid")):
                     crawl_logger.warning("Crawler reported invalid state, triggering auth refresh")
@@ -204,6 +234,155 @@ class CrawlService:
                         output_path=str(output_path),
                         started_at=started_at,
                         finished_at=finished_at,
+                        quality_score=quality_score,
+                        degraded=True,
+                        degraded_reason="state_invalid",
+                        framework_detected=framework_detected,
+                        extractor_chain=extractor_chain,
+                        failure_categories=["state_invalid"],
+                    )
+
+                incoming_fingerprint = _build_payload_fingerprint(payload)
+                existing_fingerprint = await self._build_existing_snapshot_fingerprint(system.id)
+                if strict_mode and low_confidence:
+                    message = (
+                        "Strict mode rejected low-confidence payload"
+                        + (
+                            f": coverage_score={quality_score:.3f}"
+                            if quality_score is not None
+                            else ""
+                        )
+                    )
+                    await self.task_tracker.finish(
+                        log_id=task_log_id,
+                        status="failed",
+                        error_message=message,
+                        retry_count=0,
+                    )
+                    finished_at = _utc_now()
+                    crawl_logger.bind(
+                        strict_mode=True,
+                        quality_score=quality_score,
+                    ).warning("Strict mode rejected crawl payload")
+                    return CrawlRunResult(
+                        sys_code=sys_code,
+                        status="failed",
+                        message=message,
+                        crawl_log_id=task_log_id,
+                        auth_triggered=False,
+                        menus_saved=0,
+                        pages_saved=0,
+                        elements_saved=0,
+                        output_path=str(output_path),
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        quality_score=quality_score,
+                        degraded=True,
+                        degraded_reason=degraded_reason or "payload_low_confidence",
+                        framework_detected=framework_detected,
+                        extractor_chain=extractor_chain,
+                        failure_categories=failure_categories,
+                    )
+
+                if (
+                    existing_fingerprint
+                    and low_confidence
+                ):
+                    now = _utc_now()
+                    await self.session.exec(
+                        update(WebSystem)
+                        .where(WebSystem.id == system.id)
+                        .values(last_crawl_at=now, updated_at=now)
+                    )
+                    await self.session.commit()
+                    snapshot_counts = await self._current_snapshot_counts(system.id)
+                    message = (
+                        "Low-confidence payload"
+                        + (
+                            f" (coverage_score={quality_score:.3f})"
+                            if quality_score is not None
+                            else ""
+                        )
+                        + " detected. "
+                        "Preserved existing snapshot."
+                    )
+                    await self.task_tracker.finish(
+                        log_id=task_log_id,
+                        status="success",
+                        retry_count=0,
+                        changed=False,
+                        pages_found=snapshot_counts["pages"],
+                        elements_found=snapshot_counts["elements"],
+                        error_message="payload_low_confidence",
+                    )
+                    crawl_logger.bind(
+                        quality_score=quality_score,
+                        pages=snapshot_counts["pages"],
+                        elements=snapshot_counts["elements"],
+                    ).warning("Skipped persistence due to low-confidence payload")
+                    finished_at = _utc_now()
+                    return CrawlRunResult(
+                        sys_code=sys_code,
+                        status="success",
+                        message=message,
+                        crawl_log_id=task_log_id,
+                        auth_triggered=False,
+                        menus_saved=0,
+                        pages_saved=0,
+                        elements_saved=0,
+                        output_path=str(output_path),
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        quality_score=quality_score,
+                        degraded=True,
+                        degraded_reason=degraded_reason or "payload_low_confidence",
+                        framework_detected=framework_detected,
+                        extractor_chain=extractor_chain,
+                        failure_categories=failure_categories,
+                    )
+
+                if existing_fingerprint and incoming_fingerprint == existing_fingerprint:
+                    now = _utc_now()
+                    await self.session.exec(
+                        update(WebSystem)
+                        .where(WebSystem.id == system.id)
+                        .values(last_crawl_at=now, updated_at=now)
+                    )
+                    await self.session.commit()
+                    snapshot_counts = await self._current_snapshot_counts(system.id)
+
+                    await self.task_tracker.finish(
+                        log_id=task_log_id,
+                        status="success",
+                        retry_count=0,
+                        changed=False,
+                        pages_found=snapshot_counts["pages"],
+                        elements_found=snapshot_counts["elements"],
+                    )
+                    crawl_logger.bind(
+                        payload_fingerprint=incoming_fingerprint,
+                        pages=snapshot_counts["pages"],
+                        elements=snapshot_counts["elements"],
+                    ).info("Crawl payload unchanged; skipped DB overwrite")
+                    finished_at = _utc_now()
+                    return CrawlRunResult(
+                        sys_code=sys_code,
+                        status="success",
+                        message="Menu map unchanged. Skipped persistence overwrite.",
+                        crawl_log_id=task_log_id,
+                        auth_triggered=False,
+                        menus_saved=0,
+                        pages_saved=0,
+                        elements_saved=0,
+                        output_path=str(output_path),
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        quality_score=quality_score,
+                        degraded=degraded,
+                        degraded_reason=degraded_reason,
+                        framework_detected=framework_detected,
+                        extractor_chain=extractor_chain,
+                        failure_categories=failure_categories,
                     )
 
                 save_result = await self._persist_payload(system.id, payload)
@@ -219,6 +398,7 @@ class CrawlService:
                     log_id=task_log_id,
                     status="success",
                     retry_count=0,
+                    changed=True,
                     pages_found=save_result["pages_saved"],
                     elements_found=save_result["elements_saved"],
                 )
@@ -241,6 +421,12 @@ class CrawlService:
                     output_path=str(output_path),
                     started_at=started_at,
                     finished_at=finished_at,
+                    quality_score=quality_score,
+                    degraded=degraded,
+                    degraded_reason=degraded_reason,
+                    framework_detected=framework_detected,
+                    extractor_chain=extractor_chain,
+                    failure_categories=failure_categories,
                 )
             except Exception as exc:
                 crawl_logger.exception("Crawl run failed")
@@ -268,197 +454,409 @@ class CrawlService:
 
     async def _persist_payload(self, system_id: UUID, payload: dict[str, Any]) -> dict[str, int]:
         menus, pages, payload_meta = _validate_payload_before_overwrite(payload)
+        now = _utc_now()
 
-        page_ids_subq = select(AppPage.id).where(AppPage.system_id == system_id)
-        await self.session.exec(delete(UIElement).where(UIElement.page_id.in_(page_ids_subq)))
-        await self.session.exec(delete(UIContainer).where(UIContainer.page_id.in_(page_ids_subq)))
-        await self.session.exec(delete(AppPage).where(AppPage.system_id == system_id))
-        await self.session.exec(delete(NavMenu).where(NavMenu.system_id == system_id))
-        await self.session.flush()
+        existing_menus = (await self.session.exec(select(NavMenu).where(NavMenu.system_id == system_id))).all()
+        existing_pages = (await self.session.exec(select(AppPage).where(AppPage.system_id == system_id))).all()
+        existing_pages_by_identity: dict[str, list[AppPage]] = defaultdict(list)
+        for page in existing_pages:
+            identity = _page_identity_key(page.url_pattern, None)
+            if identity:
+                existing_pages_by_identity[identity].append(page)
+
+        existing_elements_by_page: dict[UUID, list[dict[str, Any]]] = defaultdict(list)
+        existing_containers_by_page: dict[UUID, list[dict[str, Any]]] = defaultdict(list)
+        existing_page_ids = [page.id for page in existing_pages]
+        if existing_page_ids:
+            existing_elements = (
+                await self.session.exec(
+                    select(UIElement).where(UIElement.page_id.in_(existing_page_ids))
+                )
+            ).all()
+            for element in existing_elements:
+                existing_elements_by_page[element.page_id].append(
+                    {
+                        "tag_name": element.tag_name,
+                        "element_type": element.element_type,
+                        "dom_css_path": element.dom_css_path,
+                        "locator_tier": element.locator_tier,
+                        "is_global_chrome": element.is_global_chrome,
+                        "is_business_useful": element.is_business_useful,
+                    }
+                )
+            existing_containers = (
+                await self.session.exec(
+                    select(UIContainer).where(UIContainer.page_id.in_(existing_page_ids))
+                )
+            ).all()
+            for container in existing_containers:
+                existing_containers_by_page[container.page_id].append(
+                    {
+                        "container_type": container.container_type,
+                        "title": container.title,
+                        "xpath_root": container.xpath_root,
+                        "css_selector": container.css_selector,
+                        "trigger_action": container.trigger_action,
+                        "is_dynamic": container.is_dynamic,
+                        "is_visible_default": container.is_visible_default,
+                    }
+                )
+
+        existing_menus_by_identity: dict[tuple[str, str, str, str], list[NavMenu]] = defaultdict(list)
+        for menu in existing_menus:
+            existing_menus_by_identity[_menu_identity_from_model(menu)].append(menu)
 
         node_id_map: dict[str, UUID] = {}
-        for index, node in enumerate(menus, start=1):
-            raw_node_id = str(node.get("node_id") or f"node-{index}")
-            node_id_map[raw_node_id] = uuid4()
-
-        nav_insert_sql = text(
-            """
-            INSERT INTO nav_menus (
-                id, system_id, parent_id, node_path, title, text_breadcrumb, icon,
-                menu_order, menu_level, path_indexes, node_type, target_url, route_path,
-                route_name, playwright_locator, source, is_ai_primary_candidate, ai_candidate_rank,
-                last_verified_status, last_verified_at,
-                is_group, is_external, is_visible
-            ) VALUES (
-                :id, :system_id, :parent_id, CAST(:node_path AS ltree), :title, :text_breadcrumb, :icon,
-                :menu_order, :menu_level, CAST(:path_indexes AS jsonb), :node_type, :target_url, :route_path,
-                :route_name, :playwright_locator, :source, :is_ai_primary_candidate, :ai_candidate_rank,
-                :last_verified_status, :last_verified_at,
-                :is_group, :is_external, :is_visible
-            )
-            """
-        )
-
+        menu_models_by_id: dict[UUID, NavMenu] = {}
+        processed_menu_ids: set[UUID] = set()
         route_name_by_menu_id: dict[UUID, str | None] = {}
+        pending_node_paths: dict[UUID, str] = {}
+        for index, node in enumerate(menus, start=1):
+            identity = _menu_identity_from_payload(node, default_index=index)
+            candidates = existing_menus_by_identity.get(identity, [])
+            menu_model = candidates.pop(0) if candidates else None
+            if menu_model is None:
+                menu_model = NavMenu(system_id=system_id, title="")
+                self.session.add(menu_model)
+            raw_node_id = str(node.get("node_id") or f"node-{index}")
+            node_id_map[raw_node_id] = menu_model.id
+            menu_models_by_id[menu_model.id] = menu_model
+            processed_menu_ids.add(menu_model.id)
+
         for index, node in enumerate(menus, start=1):
             raw_node_id = str(node.get("node_id") or f"node-{index}")
-            node_uuid = node_id_map[raw_node_id]
+            menu_model = menu_models_by_id[node_id_map[raw_node_id]]
             parent_raw = str(node.get("parent_id") or "")
             parent_uuid = node_id_map.get(parent_raw)
             path_indexes = node.get("path_indexes") if isinstance(node.get("path_indexes"), list) else None
             route_name = _safe_str(node.get("route_name"), 255)
-            route_name_by_menu_id[node_uuid] = route_name
+            route_name_by_menu_id[menu_model.id] = route_name
 
-            await self.session.execute(
-                nav_insert_sql,
-                {
-                    "id": node_uuid,
-                    "system_id": system_id,
-                    "parent_id": parent_uuid,
-                    "node_path": _normalize_ltree_path(node, index),
-                    "title": str(node.get("title") or node.get("route_name") or "未命名菜单")[:255],
-                    "text_breadcrumb": node.get("text_breadcrumb"),
-                    "icon": _safe_str(node.get("icon"), 128),
-                    "menu_order": _to_int(node.get("menu_order")),
-                    "menu_level": _to_int(node.get("menu_level")),
-                    "path_indexes": json.dumps(path_indexes, ensure_ascii=False) if path_indexes is not None else None,
-                    "node_type": _safe_str(node.get("node_type"), 20),
-                    "target_url": _safe_str(node.get("target_url"), 500),
-                    "route_path": _safe_str(node.get("route_path"), 500),
-                    "route_name": route_name,
-                    "playwright_locator": node.get("playwright_locator"),
-                    "source": _safe_str(node.get("source"), 50),
-                    "is_ai_primary_candidate": _to_bool(node.get("is_ai_primary_candidate")),
-                    "ai_candidate_rank": _to_int(node.get("ai_candidate_rank")),
-                    "last_verified_status": "ok",
-                    "last_verified_at": _utc_now(),
-                    "is_group": _to_bool(node.get("is_group")),
-                    "is_external": _to_bool(node.get("is_external")),
-                    "is_visible": _to_bool(node.get("is_visible")),
-                },
-            )
+            menu_model.parent_id = parent_uuid
+            # Database column type is ltree; ORM assignment as plain str causes type mismatch.
+            # Persist node_path via explicit CAST(:node_path AS ltree) after flush.
+            pending_node_paths[menu_model.id] = _normalize_ltree_path(node, index)
+            menu_model.node_path = None
+            menu_model.title = str(node.get("title") or node.get("route_name") or "未命名菜单")[:255]
+            menu_model.text_breadcrumb = _safe_str(node.get("text_breadcrumb"), 500)
+            menu_model.icon = _safe_str(node.get("icon"), 128)
+            menu_model.menu_order = _to_int(node.get("menu_order"))
+            menu_model.menu_level = _to_int(node.get("menu_level"))
+            menu_model.path_indexes = path_indexes
+            menu_model.node_type = _safe_str(node.get("node_type"), 20)
+            menu_model.target_url = _safe_str(node.get("target_url"), 500)
+            menu_model.route_path = _safe_str(node.get("route_path"), 500)
+            menu_model.route_name = route_name
+            menu_model.playwright_locator = node.get("playwright_locator")
+            menu_model.source = _safe_str(node.get("source"), 50)
+            menu_model.is_ai_primary_candidate = _to_bool(node.get("is_ai_primary_candidate"))
+            menu_model.ai_candidate_rank = _to_int(node.get("ai_candidate_rank"))
+            menu_model.last_verified_status = "ok"
+            menu_model.last_verified_at = now
+            menu_model.is_group = _to_bool(node.get("is_group"))
+            menu_model.is_external = _to_bool(node.get("is_external"))
+            menu_model.is_visible = _to_bool(node.get("is_visible"))
+            menu_model.updated_at = now
+            self.session.add(menu_model)
+        await self.session.flush()
+        update_node_path_sql = text("UPDATE nav_menus SET node_path = CAST(:node_path AS ltree) WHERE id = :id")
+        for menu_id, node_path in pending_node_paths.items():
+            await self.session.execute(update_node_path_sql, {"id": menu_id, "node_path": node_path})
         await self.session.flush()
 
         menu_by_route: dict[str, UUID] = {}
         menu_by_target_url: dict[str, UUID] = {}
-        for node in menus:
-            node_uuid = node_id_map.get(str(node.get("node_id") or ""))
+        for index, node in enumerate(menus, start=1):
+            raw_node_id = str(node.get("node_id") or f"node-{index}")
+            node_uuid = node_id_map.get(raw_node_id)
             if not node_uuid:
                 continue
-            route_path = str(node.get("route_path") or "").strip()
+            route_path = _normalize_route_path(node.get("route_path"))
             if route_path:
                 menu_by_route.setdefault(route_path, node_uuid)
-            target_url = str(node.get("target_url") or "").strip()
+            target_url = _normalize_target_url(node.get("target_url"))
             if target_url:
                 menu_by_target_url.setdefault(target_url, node_uuid)
 
+        processed_page_ids: set[UUID] = set()
         pages_saved = 0
         elements_saved = 0
 
         for page_payload in pages:
-            url_pattern = str(page_payload.get("url_pattern") or page_payload.get("target_url") or "").strip()
+            url_pattern = _safe_str(page_payload.get("url_pattern") or page_payload.get("target_url"), 500)
             if not url_pattern:
                 continue
+            pages_saved += 1
+            elements_saved += len(page_payload.get("elements") or [])
+
+            page_identity = _page_identity_key(url_pattern, page_payload.get("target_url"))
+            page_candidates = existing_pages_by_identity.get(page_identity or "", [])
+            page_model = page_candidates.pop(0) if page_candidates else None
+            existing_page_fp: str | None = None
+            if page_model is not None:
+                existing_page_fp = _build_single_page_fingerprint(
+                    {
+                        "url_pattern": page_model.url_pattern,
+                        "target_url": page_model.meta_info.get("target_url")
+                        if isinstance(page_model.meta_info, dict)
+                        else None,
+                        "route_name": page_model.route_name,
+                        "page_title": page_model.page_title,
+                        "containers": existing_containers_by_page.get(page_model.id, []),
+                        "elements": existing_elements_by_page.get(page_model.id, []),
+                    }
+                )
+            else:
+                page_model = AppPage(system_id=system_id, url_pattern=url_pattern)
+                self.session.add(page_model)
+                await self.session.flush()
 
             route_path = self._route_path_from_url_pattern(url_pattern)
-            menu_id = menu_by_route.get(route_path or "") or menu_by_target_url.get(
-                str(page_payload.get("target_url") or "")
-            )
-            page_model = AppPage(
-                system_id=system_id,
-                menu_id=menu_id,
-                url_pattern=url_pattern[:500],
-                route_name=self._guess_route_name(menu_id, route_name_by_menu_id),
-                page_title=_safe_str(page_payload.get("page_title"), 255),
-                page_summary=_build_page_summary(page_payload),
-                description=None,
-                keywords=_extract_page_keywords(page_payload),
-                meta_info={
-                    "target_url": page_payload.get("target_url"),
-                    "errors": page_payload.get("errors") or [],
-                    "elements_raw_count": _to_int(page_payload.get("elements_raw_count")),
-                    "elements_filtered_out_count": _to_int(page_payload.get("elements_filtered_out_count")),
-                    "ai_context_hints": payload_meta.get("ai_context_hints"),
-                },
-                screenshot_path=_safe_str(page_payload.get("screenshot_path"), 1000),
-                actionable_element_count=len(page_payload.get("elements") or []),
-                elements_raw_count=_to_int(page_payload.get("elements_raw_count")),
-                elements_filtered_out_count=_to_int(page_payload.get("elements_filtered_out_count")),
-                is_crawled=_to_bool(page_payload.get("is_crawled")),
-                crawled_at=_parse_dt(page_payload.get("crawled_at")),
-            )
+            target_url = _normalize_target_url(page_payload.get("target_url"))
+            menu_id = menu_by_route.get(route_path or "") or menu_by_target_url.get(target_url)
+            page_model.menu_id = menu_id
+            page_model.url_pattern = url_pattern
+            page_model.route_name = self._guess_route_name(menu_id, route_name_by_menu_id)
+            page_model.page_title = _safe_str(page_payload.get("page_title"), 255)
+            page_model.page_summary = _build_page_summary(page_payload)
+            page_model.description = None
+            page_model.keywords = _extract_page_keywords(page_payload)
+            page_model.meta_info = {
+                "target_url": page_payload.get("target_url"),
+                "errors": page_payload.get("errors") or [],
+                "elements_raw_count": _to_int(page_payload.get("elements_raw_count")),
+                "elements_filtered_out_count": _to_int(page_payload.get("elements_filtered_out_count")),
+                "ai_context_hints": payload_meta.get("ai_context_hints"),
+            }
+            page_model.screenshot_path = _safe_str(page_payload.get("screenshot_path"), 1000)
+            page_model.actionable_element_count = len(page_payload.get("elements") or [])
+            page_model.elements_raw_count = _to_int(page_payload.get("elements_raw_count"))
+            page_model.elements_filtered_out_count = _to_int(page_payload.get("elements_filtered_out_count"))
+            page_model.is_crawled = _to_bool(page_payload.get("is_crawled"))
+            page_model.crawled_at = _parse_dt(page_payload.get("crawled_at"))
+            page_model.updated_at = now
             self.session.add(page_model)
             await self.session.flush()
-            pages_saved += 1
+            processed_page_ids.add(page_model.id)
 
-            container_map: dict[str, UUID] = {}
-            containers_payload = (page_payload.get("containers") or []) + (page_payload.get("modal_containers") or [])
-            for container in containers_payload:
-                raw_container_id = str(container.get("container_id") or f"container-{uuid4().hex}")
-                container_model = UIContainer(
-                    page_id=page_model.id,
-                    container_type=_safe_str(container.get("container_type"), 50) or "page_body",
-                    title=_safe_str(container.get("title"), 255),
-                    xpath_root=_safe_str(container.get("xpath_root"), 1000),
-                    css_selector=_safe_str(container.get("css_selector"), 1000),
-                    trigger_element_id=None,
-                    trigger_action=_safe_str(container.get("trigger_action"), 50),
-                    is_dynamic=_to_bool(container.get("is_dynamic")),
-                    is_visible_default=_to_bool(container.get("is_visible_default")),
+            incoming_page_fp = _build_single_page_fingerprint(
+                {
+                    "url_pattern": url_pattern,
+                    "target_url": page_payload.get("target_url"),
+                    "route_name": page_model.route_name,
+                    "page_title": page_payload.get("page_title"),
+                    "containers": page_payload.get("containers") or [],
+                    "modal_containers": page_payload.get("modal_containers") or [],
+                    "elements": page_payload.get("elements") or [],
+                }
+            )
+            if existing_page_fp and existing_page_fp == incoming_page_fp:
+                continue
+
+            await self._upsert_page_children(page_model.id, page_payload)
+
+        stale_page_ids = [page.id for page in existing_pages if page.id not in processed_page_ids]
+        if stale_page_ids:
+            await self.session.exec(delete(UIElement).where(UIElement.page_id.in_(stale_page_ids)))
+            await self.session.exec(delete(UIContainer).where(UIContainer.page_id.in_(stale_page_ids)))
+            await self.session.exec(delete(AppPage).where(AppPage.id.in_(stale_page_ids)))
+
+        stale_menu_ids = [menu.id for menu in existing_menus if menu.id not in processed_menu_ids]
+        if stale_menu_ids:
+            used_menu_ids = set(
+                await self.session.exec(
+                    select(AppPage.menu_id).where(AppPage.system_id == system_id, AppPage.menu_id.is_not(None))
                 )
-                self.session.add(container_model)
-                await self.session.flush()
-                container_map[raw_container_id] = container_model.id
-
-            for element in page_payload.get("elements") or []:
-                locators = element.get("locators")
-                if not isinstance(locators, dict):
-                    locators = {"dom_css_path": element.get("dom_css_path") or ""}
-                locator_tier = _safe_str(element.get("locator_tier"), 32)
-                stability_score = _to_float(element.get("stability_score"))
-                is_global_chrome = _to_bool(element.get("is_global_chrome"))
-                is_business_useful = _to_bool(element.get("is_business_useful"))
-                if is_business_useful is None:
-                    is_business_useful = True
-
-                locators_quality = locators.get("quality")
-                if not isinstance(locators_quality, dict):
-                    locators_quality = {}
-                if locator_tier:
-                    locators_quality.setdefault("locator_tier", locator_tier)
-                if stability_score is not None:
-                    locators_quality.setdefault("stability_score", stability_score)
-                if is_global_chrome is not None:
-                    locators_quality.setdefault("is_global_chrome", is_global_chrome)
-                if locators_quality:
-                    locators["quality"] = locators_quality
-
-                ui_element = UIElement(
-                    page_id=page_model.id,
-                    container_id=container_map.get(str(element.get("container_id") or "")),
-                    tag_name=_safe_str(element.get("tag_name"), 50) or "div",
-                    element_type=_safe_str(element.get("element_type"), 50),
-                    text_content=element.get("text_content"),
-                    locators=locators,
-                    playwright_locator=element.get("playwright_locator"),
-                    dom_css_path=_safe_str(element.get("dom_css_path"), 1000),
-                    locator_tier=locator_tier,
-                    stability_score=stability_score,
-                    is_global_chrome=is_global_chrome,
-                    is_business_useful=is_business_useful,
-                    nearby_text=element.get("nearby_text"),
-                    usage_description=_infer_usage_description(element),
-                    screenshot_slice_path=None,
-                    bounding_box=element.get("bounding_box") if isinstance(element.get("bounding_box"), dict) else None,
-                )
-                self.session.add(ui_element)
-                elements_saved += 1
+            )
+            deletable_menu_ids = [menu_id for menu_id in stale_menu_ids if menu_id not in used_menu_ids]
+            if deletable_menu_ids:
+                await self.session.exec(delete(NavMenu).where(NavMenu.id.in_(deletable_menu_ids)))
 
         await self.session.flush()
         return {
-            "menus_saved": len(node_id_map),
+            "menus_saved": len(menus),
             "pages_saved": pages_saved,
             "elements_saved": elements_saved,
+        }
+
+    async def _upsert_page_children(self, page_id: UUID, page_payload: dict[str, Any]) -> None:
+        await self.session.exec(delete(UIElement).where(UIElement.page_id == page_id))
+        await self.session.exec(delete(UIContainer).where(UIContainer.page_id == page_id))
+        await self.session.flush()
+
+        container_map: dict[str, UUID] = {}
+        containers_payload = (page_payload.get("containers") or []) + (page_payload.get("modal_containers") or [])
+        for container in containers_payload:
+            raw_container_id = str(container.get("container_id") or f"container-{uuid4().hex}")
+            container_model = UIContainer(
+                page_id=page_id,
+                container_type=_safe_str(container.get("container_type"), 50) or "page_body",
+                title=_safe_str(container.get("title"), 255),
+                xpath_root=_safe_str(container.get("xpath_root"), 1000),
+                css_selector=_safe_str(container.get("css_selector"), 1000),
+                trigger_element_id=None,
+                trigger_action=_safe_str(container.get("trigger_action"), 50),
+                is_dynamic=_to_bool(container.get("is_dynamic")),
+                is_visible_default=_to_bool(container.get("is_visible_default")),
+            )
+            self.session.add(container_model)
+            await self.session.flush()
+            container_map[raw_container_id] = container_model.id
+
+        for element in page_payload.get("elements") or []:
+            locators = element.get("locators")
+            if not isinstance(locators, dict):
+                locators = {"dom_css_path": element.get("dom_css_path") or ""}
+            locator_tier = _safe_str(element.get("locator_tier"), 32)
+            stability_score = _to_float(element.get("stability_score"))
+            is_global_chrome = _to_bool(element.get("is_global_chrome"))
+            is_business_useful = _to_bool(element.get("is_business_useful"))
+            if is_business_useful is None:
+                is_business_useful = True
+
+            locators_quality = locators.get("quality")
+            if not isinstance(locators_quality, dict):
+                locators_quality = {}
+            if locator_tier:
+                locators_quality.setdefault("locator_tier", locator_tier)
+            if stability_score is not None:
+                locators_quality.setdefault("stability_score", stability_score)
+            if is_global_chrome is not None:
+                locators_quality.setdefault("is_global_chrome", is_global_chrome)
+            if locators_quality:
+                locators["quality"] = locators_quality
+
+            ui_element = UIElement(
+                page_id=page_id,
+                container_id=container_map.get(str(element.get("container_id") or "")),
+                tag_name=_safe_str(element.get("tag_name"), 50) or "div",
+                element_type=_safe_str(element.get("element_type"), 50),
+                text_content=element.get("text_content"),
+                locators=locators,
+                playwright_locator=element.get("playwright_locator"),
+                dom_css_path=_safe_str(element.get("dom_css_path"), 1000),
+                locator_tier=locator_tier,
+                stability_score=stability_score,
+                is_global_chrome=is_global_chrome,
+                is_business_useful=is_business_useful,
+                nearby_text=element.get("nearby_text"),
+                usage_description=_infer_usage_description(element),
+                screenshot_slice_path=None,
+                bounding_box=element.get("bounding_box") if isinstance(element.get("bounding_box"), dict) else None,
+            )
+            self.session.add(ui_element)
+
+    async def _build_existing_snapshot_fingerprint(self, system_id: UUID) -> str | None:
+        menus = (
+            await self.session.exec(
+                select(NavMenu).where(NavMenu.system_id == system_id)
+            )
+        ).all()
+        pages = (
+            await self.session.exec(
+                select(AppPage).where(AppPage.system_id == system_id)
+            )
+        ).all()
+
+        if not menus and not pages:
+            return None
+
+        page_ids = [page.id for page in pages]
+        elements_by_page: dict[UUID, list[dict[str, Any]]] = defaultdict(list)
+        containers_by_page: dict[UUID, list[dict[str, Any]]] = defaultdict(list)
+        if page_ids:
+            elements = (
+                await self.session.exec(
+                    select(UIElement).where(UIElement.page_id.in_(page_ids))
+                )
+            ).all()
+            for element in elements:
+                elements_by_page[element.page_id].append(
+                    {
+                        "tag_name": element.tag_name,
+                        "element_type": element.element_type,
+                        "playwright_locator": element.playwright_locator,
+                        "dom_css_path": element.dom_css_path,
+                        "locator_tier": element.locator_tier,
+                        "is_global_chrome": element.is_global_chrome,
+                        "is_business_useful": element.is_business_useful,
+                    }
+                )
+            containers = (
+                await self.session.exec(
+                    select(UIContainer).where(UIContainer.page_id.in_(page_ids))
+                )
+            ).all()
+            for container in containers:
+                containers_by_page[container.page_id].append(
+                    {
+                        "container_type": container.container_type,
+                        "title": container.title,
+                        "xpath_root": container.xpath_root,
+                        "css_selector": container.css_selector,
+                        "trigger_action": container.trigger_action,
+                        "is_dynamic": container.is_dynamic,
+                        "is_visible_default": container.is_visible_default,
+                    }
+                )
+
+        snapshot_payload: dict[str, Any] = {"menus": [], "pages": []}
+        for menu in menus:
+            snapshot_payload["menus"].append(
+                {
+                    "title": menu.title,
+                    "text_breadcrumb": menu.text_breadcrumb,
+                    "menu_order": menu.menu_order,
+                    "menu_level": menu.menu_level,
+                    "path_indexes": menu.path_indexes,
+                    "node_type": menu.node_type,
+                    "target_url": menu.target_url,
+                    "route_path": menu.route_path,
+                    "route_name": menu.route_name,
+                    "source": menu.source,
+                    "is_group": menu.is_group,
+                    "is_external": menu.is_external,
+                    "is_visible": menu.is_visible,
+                }
+            )
+        for page in pages:
+            target_url = None
+            if isinstance(page.meta_info, dict):
+                target_url = page.meta_info.get("target_url")
+            snapshot_payload["pages"].append(
+                {
+                    "url_pattern": page.url_pattern,
+                    "target_url": target_url,
+                    "route_name": page.route_name,
+                    "page_title": page.page_title,
+                    "containers": containers_by_page.get(page.id, []),
+                    "elements": elements_by_page.get(page.id, []),
+                }
+            )
+        return _build_payload_fingerprint(snapshot_payload)
+
+    async def _current_snapshot_counts(self, system_id: UUID) -> dict[str, int]:
+        pages_subq = select(AppPage.id).where(AppPage.system_id == system_id)
+
+        menus_count = (
+            await self.session.exec(
+                select(func.count(NavMenu.id)).where(NavMenu.system_id == system_id)
+            )
+        ).one()
+        pages_count = (
+            await self.session.exec(
+                select(func.count(AppPage.id)).where(AppPage.system_id == system_id)
+            )
+        ).one()
+        elements_count = (
+            await self.session.exec(
+                select(func.count(UIElement.id)).where(UIElement.page_id.in_(pages_subq))
+            )
+        ).one()
+        return {
+            "menus": int(menus_count or 0),
+            "pages": int(pages_count or 0),
+            "elements": int(elements_count or 0),
         }
 
     async def _run_crawler_script(
@@ -474,6 +872,7 @@ class CrawlService:
         expand_rounds: int,
         menu_selector: str,
         home_url: str,
+        framework_hint: str,
     ) -> Path:
         runtime_dir = Path("output/playwright/runtime").resolve() / f"{system.sys_code}-{int(_utc_now().timestamp())}"
         runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -524,6 +923,8 @@ class CrawlService:
             str(expand_rounds),
             "--timeout-ms",
             str(timeout_ms),
+            "--framework-hint",
+            framework_hint or "auto",
         ]
         if menu_selector:
             cmd.extend(["--menu-selector", menu_selector])
@@ -594,8 +995,13 @@ class CrawlService:
 
     @staticmethod
     def _default_home_url(system: WebSystem) -> str:
-        base = system.base_url.rstrip("/")
-        return f"{base}/{DEFAULT_HOME_PATH}" if "#/" not in base else base
+        raw_base = str(system.base_url or "").strip()
+        if "#/" in raw_base:
+            return raw_base
+        if raw_base.endswith("#"):
+            return f"{raw_base}/"
+        base = raw_base.rstrip("/")
+        return f"{base}/{DEFAULT_HOME_PATH}"
 
     @staticmethod
     def _route_path_from_url_pattern(url_pattern: str) -> str | None:
@@ -626,6 +1032,232 @@ def _validate_payload_before_overwrite(payload: dict[str, Any]) -> tuple[list[di
         raise RuntimeError("Crawler payload empty: refused to overwrite existing crawl snapshot.")
     payload_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     return menus, pages, payload_meta
+
+
+def _build_single_page_fingerprint(page_payload: dict[str, Any]) -> str:
+    normalized = _normalize_page_for_fingerprint(page_payload)
+    encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _page_identity_key(url_pattern: Any, target_url: Any) -> str:
+    normalized = _normalize_url_pattern(url_pattern, target_url)
+    return normalized[:500]
+
+
+def _menu_identity_from_payload(node: dict[str, Any], *, default_index: int) -> tuple[str, str, str, str]:
+    indexes = node.get("path_indexes") if isinstance(node.get("path_indexes"), list) else []
+    normalized_indexes: list[str] = []
+    for value in indexes:
+        parsed = _to_int(value)
+        normalized_indexes.append(str(parsed if parsed is not None else value))
+    return (
+        _normalize_route_path(node.get("route_path")),
+        _normalize_target_url(node.get("target_url")),
+        _normalize_ltree_path(node, default_index),
+        ",".join(normalized_indexes),
+    )
+
+
+def _menu_identity_from_model(menu: NavMenu) -> tuple[str, str, str, str]:
+    indexes = menu.path_indexes or []
+    normalized_indexes: list[str] = []
+    for value in indexes:
+        parsed = _to_int(value)
+        normalized_indexes.append(str(parsed if parsed is not None else value))
+    return (
+        _normalize_route_path(menu.route_path),
+        _normalize_target_url(menu.target_url),
+        _normalize_text(menu.node_path),
+        ",".join(normalized_indexes),
+    )
+
+
+def _build_payload_fingerprint(payload: dict[str, Any]) -> str:
+    """Build stable content fingerprint for menu/page payload.
+
+    The fingerprint intentionally ignores volatile runtime fields (timestamps, screenshots)
+    and normalizes selector noise like nth-of-type index values.
+    """
+
+    menus_payload = payload.get("menus") if isinstance(payload.get("menus"), list) else []
+    pages_payload = payload.get("pages") if isinstance(payload.get("pages"), list) else []
+
+    canonical_menus = [
+        _normalize_menu_for_fingerprint(node)
+        for node in menus_payload
+        if isinstance(node, dict)
+    ]
+    canonical_pages = [
+        _normalize_page_for_fingerprint(page)
+        for page in pages_payload
+        if isinstance(page, dict)
+    ]
+
+    canonical_menus.sort(
+        key=lambda item: (
+            item["route_path"],
+            item["target_url"],
+            item["title"],
+            item["menu_level"],
+            item["menu_order"],
+            item["path_indexes"],
+        )
+    )
+    canonical_pages.sort(
+        key=lambda item: (
+            item["url_pattern"],
+            item["target_url"],
+            item["route_name"],
+            item["page_title"],
+        )
+    )
+
+    canonical_payload = {
+        "menus": canonical_menus,
+        "pages": canonical_pages,
+    }
+    encoded = json.dumps(canonical_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _normalize_menu_for_fingerprint(node: dict[str, Any]) -> dict[str, Any]:
+    indexes = node.get("path_indexes") if isinstance(node.get("path_indexes"), list) else []
+    normalized_indexes: list[str] = []
+    for value in indexes:
+        parsed = _to_int(value)
+        normalized_indexes.append(str(parsed if parsed is not None else value))
+    menu_order = _to_int(node.get("menu_order"))
+    if menu_order is None:
+        menu_order = -1
+    menu_level = _to_int(node.get("menu_level"))
+    if menu_level is None:
+        menu_level = -1
+    return {
+        "title": _normalize_text(node.get("title")),
+        "text_breadcrumb": _normalize_text(node.get("text_breadcrumb")),
+        "menu_order": menu_order,
+        "menu_level": menu_level,
+        "path_indexes": ",".join(normalized_indexes),
+        "node_type": _normalize_text(node.get("node_type")),
+        "target_url": _normalize_target_url(node.get("target_url")),
+        "route_path": _normalize_route_path(node.get("route_path")),
+        "route_name": _normalize_text(node.get("route_name")),
+        "source": _normalize_text(node.get("source")),
+        "is_group": _to_bool(node.get("is_group")),
+        "is_external": _to_bool(node.get("is_external")),
+        "is_visible": _to_bool(node.get("is_visible")),
+    }
+
+
+def _normalize_page_for_fingerprint(page: dict[str, Any]) -> dict[str, Any]:
+    raw_containers = page.get("containers") if isinstance(page.get("containers"), list) else []
+    raw_modal_containers = page.get("modal_containers") if isinstance(page.get("modal_containers"), list) else []
+    normalized_containers = [
+        _normalize_container_for_fingerprint(container)
+        for container in (raw_containers + raw_modal_containers)
+        if isinstance(container, dict)
+    ]
+    normalized_containers.sort(
+        key=lambda item: (
+            item["container_type"],
+            item["title"],
+            item["css_selector"],
+            item["xpath_root"],
+            item["trigger_action"],
+            str(item["is_dynamic"]),
+            str(item["is_visible_default"]),
+        )
+    )
+
+    raw_elements = page.get("elements") if isinstance(page.get("elements"), list) else []
+    normalized_elements = [
+        _normalize_element_for_fingerprint(element)
+        for element in raw_elements
+        if isinstance(element, dict)
+    ]
+    normalized_elements.sort(
+        key=lambda item: (
+            item["element_type"],
+            item["tag_name"],
+            item["dom_css_path"],
+            item["locator_tier"],
+            str(item["is_global_chrome"]),
+            str(item["is_business_useful"]),
+        )
+    )
+    return {
+        "url_pattern": _normalize_url_pattern(page.get("url_pattern"), page.get("target_url")),
+        "target_url": _normalize_target_url(page.get("target_url")),
+        "route_name": _normalize_text(page.get("route_name")),
+        "page_title": _normalize_text(page.get("page_title")),
+        "containers": normalized_containers,
+        "elements": normalized_elements,
+    }
+
+
+def _normalize_container_for_fingerprint(container: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "container_type": _normalize_text(container.get("container_type")) or "page_body",
+        "title": _normalize_text(container.get("title")),
+        "xpath_root": _normalize_css_path_for_fingerprint(container.get("xpath_root")),
+        "css_selector": _normalize_css_path_for_fingerprint(container.get("css_selector")),
+        "trigger_action": _normalize_text(container.get("trigger_action")),
+        "is_dynamic": _to_bool(container.get("is_dynamic")),
+        "is_visible_default": _to_bool(container.get("is_visible_default")),
+    }
+
+
+def _normalize_element_for_fingerprint(element: dict[str, Any]) -> dict[str, Any]:
+    dom_css_path = _normalize_css_path_for_fingerprint(element.get("dom_css_path"))
+    if not dom_css_path:
+        locators = element.get("locators")
+        if isinstance(locators, dict):
+            dom_css_path = _normalize_css_path_for_fingerprint(locators.get("dom_css_path"))
+    is_business_useful = _to_bool(element.get("is_business_useful"))
+    if is_business_useful is None:
+        is_business_useful = True
+    return {
+        "element_type": _normalize_text(element.get("element_type")),
+        "tag_name": _normalize_text(element.get("tag_name")),
+        "dom_css_path": dom_css_path,
+        "locator_tier": _normalize_text(element.get("locator_tier")),
+        "is_global_chrome": _to_bool(element.get("is_global_chrome")),
+        "is_business_useful": is_business_useful,
+    }
+
+
+def _normalize_css_path_for_fingerprint(value: Any) -> str:
+    raw = _normalize_text(value)
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    lowered = re.sub(r"nth-(of-type|child)\(\d+\)", r"nth-\1(*)", lowered)
+    lowered = re.sub(r"\s+", " ", lowered)
+    return lowered
+
+
+def _normalize_target_url(value: Any) -> str:
+    text = _normalize_text(value)
+    return text.rstrip("/")
+
+
+def _normalize_url_pattern(url_pattern: Any, target_url: Any) -> str:
+    normalized = _normalize_text(url_pattern)
+    if normalized:
+        return normalized
+    return _normalize_target_url(target_url)
+
+
+def _normalize_route_path(value: Any) -> str:
+    raw = _normalize_text(value)
+    if not raw:
+        return ""
+    if raw.startswith("/"):
+        return raw
+    if "#/" in raw:
+        return "/" + raw.split("#/", 1)[1].lstrip("/")
+    return raw
 
 
 def _normalize_authorization_value(raw_value: Any, schema: str | None) -> str | None:
@@ -735,6 +1367,45 @@ def _normalize_ltree_path(node: dict[str, Any], default_index: int) -> str:
 
 def _normalize_text(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
+
+
+def _extract_framework_detected(payload_meta: dict[str, Any]) -> str | None:
+    framework_info = payload_meta.get("framework_detection")
+    if isinstance(framework_info, dict):
+        detected = _safe_str(framework_info.get("framework_type"), 50)
+        if detected:
+            return detected
+    return _safe_str(payload_meta.get("framework_detected"), 50)
+
+
+def _normalize_extractor_chain(route_extraction_meta: Any) -> list[str] | None:
+    if not isinstance(route_extraction_meta, dict):
+        return None
+    raw_chain = route_extraction_meta.get("extractor_chain")
+    if not isinstance(raw_chain, list):
+        return None
+    chain = [_safe_str(item, 80) for item in raw_chain]
+    chain = [item for item in chain if item]
+    return chain or None
+
+
+def _normalize_failure_categories(raw_value: Any) -> list[str]:
+    if not isinstance(raw_value, list):
+        return []
+    categories: list[str] = []
+    for item in raw_value:
+        normalized = _safe_str(item, 80)
+        if not normalized:
+            continue
+        categories.append(normalized.lower())
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in categories:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
 
 
 def _unique_in_order(values: list[str]) -> list[str]:
