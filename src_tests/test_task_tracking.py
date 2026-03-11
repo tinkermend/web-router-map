@@ -26,6 +26,8 @@ async def _prepare_env(monkeypatch):
     monkeypatch.setenv("ENCRYPTION_KEY", "test-task-tracker-key")
     monkeypatch.setenv("AUTH_MAX_RETRIES", "1")
     get_settings.cache_clear()
+    if not await ping_db():
+        pytest.skip("PostgreSQL is not reachable in current environment.")
     await init_db()
     yield
     await close_db()

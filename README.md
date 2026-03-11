@@ -74,3 +74,13 @@
   - `python scripts/crawl-menu-map-from-db.py --sys-code ele.vben.pro --max-pages 10`
 - 说明:
   - 采集器复用 `scripts/crawl-menu-map.py` 能力，服务层负责状态加载、失效触发认证、结果入库与统计日志。
+
+## AI 扁平化上下文字段（新增）
+
+- `nav_menus`: `node_path`、`source`、`is_ai_primary_candidate`、`ai_candidate_rank`
+- `app_pages`: `page_summary`、`keywords`、`actionable_element_count`、`elements_raw_count`、`elements_filtered_out_count`
+- `ui_elements`: `dom_css_path`、`locator_tier`、`stability_score`、`is_global_chrome`、`is_business_useful`、`usage_description`
+
+对已有数据库执行一次迁移：
+
+- `python scripts/migrate-ai-context-schema.py`

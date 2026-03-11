@@ -18,6 +18,8 @@ from src.models.web_system import WebSystem
 async def _prepare_env(monkeypatch):
     monkeypatch.setenv("ENCRYPTION_KEY", "test-tasks-api-key")
     get_settings.cache_clear()
+    if not await ping_db():
+        pytest.skip("PostgreSQL is not reachable in current environment.")
     await init_db()
     yield
     await close_db()

@@ -29,6 +29,9 @@ class AppPage(SQLModel, table=True):
     meta_info: dict[str, Any] | None = Field(default=None, sa_column=Column(JSONB, nullable=True))
     component_path: str | None = Field(default=None, max_length=500)
     screenshot_path: str | None = Field(default=None, max_length=1000)
+    actionable_element_count: int | None = None
+    elements_raw_count: int | None = None
+    elements_filtered_out_count: int | None = None
     is_crawled: bool | None = None
     crawled_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True)))
 

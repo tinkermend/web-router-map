@@ -31,6 +31,9 @@ class NavMenu(SQLModel, table=True):
     route_path: str | None = Field(default=None, max_length=500)
     route_name: str | None = Field(default=None, max_length=255)
     playwright_locator: str | None = None
+    source: str | None = Field(default=None, max_length=50)
+    is_ai_primary_candidate: bool | None = None
+    ai_candidate_rank: int | None = None
     last_verified_status: str | None = Field(default=None, max_length=20)
     last_verified_at: datetime | None = Field(default=None, sa_column=Column(DateTime(timezone=True)))
     is_group: bool | None = None

@@ -25,6 +25,11 @@ class UIElement(SQLModel, table=True):
     text_content: str | None = None
     locators: dict[str, Any] = Field(sa_column=Column(JSONB, nullable=False))
     playwright_locator: str | None = None
+    dom_css_path: str | None = None
+    locator_tier: str | None = Field(default=None, max_length=32)
+    stability_score: float | None = None
+    is_global_chrome: bool | None = None
+    is_business_useful: bool | None = None
     nearby_text: str | None = None
     usage_description: str | None = None
     screenshot_slice_path: str | None = Field(default=None, max_length=1000)

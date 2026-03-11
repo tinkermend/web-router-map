@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -241,6 +242,7 @@ class CrawlService:
     async def _persist_payload(self, system_id: UUID, payload: dict[str, Any]) -> dict[str, int]:
         menus = payload.get("menus") or []
         pages = payload.get("pages") or []
+        payload_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
 
         page_ids_subq = select(AppPage.id).where(AppPage.system_id == system_id)
         await self.session.exec(delete(UIElement).where(UIElement.page_id.in_(page_ids_subq)))
@@ -259,12 +261,14 @@ class CrawlService:
             INSERT INTO nav_menus (
                 id, system_id, parent_id, node_path, title, text_breadcrumb, icon,
                 menu_order, menu_level, path_indexes, node_type, target_url, route_path,
-                route_name, playwright_locator, last_verified_status, last_verified_at,
+                route_name, playwright_locator, source, is_ai_primary_candidate, ai_candidate_rank,
+                last_verified_status, last_verified_at,
                 is_group, is_external, is_visible
             ) VALUES (
                 :id, :system_id, :parent_id, CAST(:node_path AS ltree), :title, :text_breadcrumb, :icon,
                 :menu_order, :menu_level, CAST(:path_indexes AS jsonb), :node_type, :target_url, :route_path,
-                :route_name, :playwright_locator, :last_verified_status, :last_verified_at,
+                :route_name, :playwright_locator, :source, :is_ai_primary_candidate, :ai_candidate_rank,
+                :last_verified_status, :last_verified_at,
                 :is_group, :is_external, :is_visible
             )
             """
@@ -286,7 +290,7 @@ class CrawlService:
                     "id": node_uuid,
                     "system_id": system_id,
                     "parent_id": parent_uuid,
-                    "node_path": None,
+                    "node_path": _normalize_ltree_path(node, index),
                     "title": str(node.get("title") or node.get("route_name") or "未命名菜单")[:255],
                     "text_breadcrumb": node.get("text_breadcrumb"),
                     "icon": _safe_str(node.get("icon"), 128),
@@ -298,6 +302,9 @@ class CrawlService:
                     "route_path": _safe_str(node.get("route_path"), 500),
                     "route_name": route_name,
                     "playwright_locator": node.get("playwright_locator"),
+                    "source": _safe_str(node.get("source"), 50),
+                    "is_ai_primary_candidate": _to_bool(node.get("is_ai_primary_candidate")),
+                    "ai_candidate_rank": _to_int(node.get("ai_candidate_rank")),
                     "last_verified_status": "ok",
                     "last_verified_at": _utc_now(),
                     "is_group": _to_bool(node.get("is_group")),
@@ -338,16 +345,20 @@ class CrawlService:
                 url_pattern=url_pattern[:500],
                 route_name=self._guess_route_name(menu_id, route_name_by_menu_id),
                 page_title=_safe_str(page_payload.get("page_title"), 255),
-                page_summary=None,
+                page_summary=_build_page_summary(page_payload),
                 description=None,
-                keywords=None,
+                keywords=_extract_page_keywords(page_payload),
                 meta_info={
                     "target_url": page_payload.get("target_url"),
                     "errors": page_payload.get("errors") or [],
                     "elements_raw_count": _to_int(page_payload.get("elements_raw_count")),
                     "elements_filtered_out_count": _to_int(page_payload.get("elements_filtered_out_count")),
+                    "ai_context_hints": payload_meta.get("ai_context_hints"),
                 },
                 screenshot_path=_safe_str(page_payload.get("screenshot_path"), 1000),
+                actionable_element_count=len(page_payload.get("elements") or []),
+                elements_raw_count=_to_int(page_payload.get("elements_raw_count")),
+                elements_filtered_out_count=_to_int(page_payload.get("elements_filtered_out_count")),
                 is_crawled=_to_bool(page_payload.get("is_crawled")),
                 crawled_at=_parse_dt(page_payload.get("crawled_at")),
             )
@@ -378,6 +389,25 @@ class CrawlService:
                 locators = element.get("locators")
                 if not isinstance(locators, dict):
                     locators = {"dom_css_path": element.get("dom_css_path") or ""}
+                locator_tier = _safe_str(element.get("locator_tier"), 32)
+                stability_score = _to_float(element.get("stability_score"))
+                is_global_chrome = _to_bool(element.get("is_global_chrome"))
+                is_business_useful = _to_bool(element.get("is_business_useful"))
+                if is_business_useful is None:
+                    is_business_useful = True
+
+                locators_quality = locators.get("quality")
+                if not isinstance(locators_quality, dict):
+                    locators_quality = {}
+                if locator_tier:
+                    locators_quality.setdefault("locator_tier", locator_tier)
+                if stability_score is not None:
+                    locators_quality.setdefault("stability_score", stability_score)
+                if is_global_chrome is not None:
+                    locators_quality.setdefault("is_global_chrome", is_global_chrome)
+                if locators_quality:
+                    locators["quality"] = locators_quality
+
                 ui_element = UIElement(
                     page_id=page_model.id,
                     container_id=container_map.get(str(element.get("container_id") or "")),
@@ -386,8 +416,13 @@ class CrawlService:
                     text_content=element.get("text_content"),
                     locators=locators,
                     playwright_locator=element.get("playwright_locator"),
+                    dom_css_path=_safe_str(element.get("dom_css_path"), 1000),
+                    locator_tier=locator_tier,
+                    stability_score=stability_score,
+                    is_global_chrome=is_global_chrome,
+                    is_business_useful=is_business_useful,
                     nearby_text=element.get("nearby_text"),
-                    usage_description=element.get("usage_description"),
+                    usage_description=_infer_usage_description(element),
                     screenshot_slice_path=None,
                     bounding_box=element.get("bounding_box") if isinstance(element.get("bounding_box"), dict) else None,
                 )
@@ -545,6 +580,15 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
+def _to_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
 def _to_bool(value: Any) -> bool | None:
     if value is None:
         return None
@@ -583,3 +627,150 @@ def _parse_dt(value: Any) -> datetime | None:
         return datetime.fromisoformat(text)
     except Exception:
         return None
+
+
+_NON_LTREE_CHAR = re.compile(r"[^A-Za-z0-9_]")
+_MULTI_UNDERSCORE = re.compile(r"_+")
+_SPLIT_TOKEN = re.compile(r"[\s,，。；;|/\\>]+")
+
+
+def _normalize_ltree_label(raw: str) -> str:
+    normalized = _MULTI_UNDERSCORE.sub("_", _NON_LTREE_CHAR.sub("_", raw or "").strip("_"))
+    if not normalized:
+        return ""
+    if normalized[0].isdigit():
+        normalized = f"n_{normalized}"
+    return normalized.lower()[:128]
+
+
+def _normalize_ltree_path(node: dict[str, Any], default_index: int) -> str:
+    raw_path = str(node.get("node_path") or "").strip()
+    if raw_path:
+        labels = [_normalize_ltree_label(part) for part in raw_path.split(".")]
+        labels = [label for label in labels if label]
+        if labels and labels[0] != "root":
+            labels.insert(0, "root")
+        if labels:
+            return ".".join(labels)
+
+    path_indexes = node.get("path_indexes")
+    if isinstance(path_indexes, list) and path_indexes:
+        labels = ["root"] + [f"n_{_to_int(value) or 0}" for value in path_indexes]
+        return ".".join(labels)
+
+    return f"root.n_{default_index}"
+
+
+def _normalize_text(value: Any) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+def _unique_in_order(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = _normalize_text(value)
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def _extract_page_keywords(page_payload: dict[str, Any]) -> list[str] | None:
+    bucket: list[str] = []
+    bucket.append(_normalize_text(page_payload.get("page_title") or ""))
+    bucket.append(_normalize_text(page_payload.get("url_pattern") or ""))
+    bucket.append(_normalize_text(page_payload.get("target_url") or ""))
+
+    for element in page_payload.get("elements") or []:
+        element_type = _normalize_text(element.get("element_type") or "")
+        text_content = _normalize_text(element.get("text_content") or "")
+        nearby_text = _normalize_text(element.get("nearby_text") or "")
+        if element_type in {"action_btn", "form_input", "nav_link"}:
+            bucket.extend([text_content, nearby_text])
+
+    keywords: list[str] = []
+    for token in bucket:
+        if not token:
+            continue
+        for part in _SPLIT_TOKEN.split(token):
+            norm = _normalize_text(part)
+            if len(norm) < 2 or len(norm) > 32:
+                continue
+            if norm.startswith("http"):
+                continue
+            keywords.append(norm.lower())
+
+    deduped = _unique_in_order(keywords)
+    if not deduped:
+        return None
+    return deduped[:20]
+
+
+def _build_page_summary(page_payload: dict[str, Any]) -> str | None:
+    title = _safe_str(page_payload.get("page_title"), 255)
+    action_labels: list[str] = []
+    field_labels: list[str] = []
+    nav_labels: list[str] = []
+    for element in page_payload.get("elements") or []:
+        label = _normalize_text(element.get("text_content") or element.get("nearby_text") or "")
+        if not label:
+            continue
+        element_type = _normalize_text(element.get("element_type") or "")
+        if element_type == "action_btn":
+            action_labels.append(label)
+        elif element_type == "form_input":
+            field_labels.append(label)
+        elif element_type == "nav_link":
+            nav_labels.append(label)
+
+    action_labels = _unique_in_order(action_labels)[:5]
+    field_labels = _unique_in_order(field_labels)[:5]
+    nav_labels = _unique_in_order(nav_labels)[:4]
+
+    sections: list[str] = []
+    if title:
+        sections.append(f"页面标题：{title}")
+    if action_labels:
+        sections.append(f"关键操作：{', '.join(action_labels)}")
+    if field_labels:
+        sections.append(f"主要字段：{', '.join(field_labels)}")
+    if nav_labels:
+        sections.append(f"可见导航：{', '.join(nav_labels)}")
+    if not sections:
+        return None
+    return "；".join(sections)[:600]
+
+
+def _infer_usage_description(element: dict[str, Any]) -> str | None:
+    explicit = _safe_str(element.get("usage_description"), 500)
+    if explicit:
+        return explicit
+
+    element_type = _normalize_text(element.get("element_type") or "")
+    text_content = _normalize_text(element.get("text_content") or "")
+    nearby_text = _normalize_text(element.get("nearby_text") or "")
+    locators = element.get("locators") if isinstance(element.get("locators"), dict) else {}
+    attrs = locators.get("attributes") if isinstance(locators.get("attributes"), dict) else {}
+    placeholder = _normalize_text(attrs.get("placeholder") or "")
+
+    if element_type == "action_btn":
+        if text_content:
+            return f"点击按钮“{text_content}”触发对应业务操作。"
+        return "点击按钮触发当前页面中的业务操作。"
+    if element_type == "form_input":
+        label = nearby_text or text_content or placeholder
+        if label:
+            return f"用于录入“{label}”相关信息。"
+        return "用于填写表单输入内容。"
+    if element_type == "nav_link":
+        label = text_content or nearby_text
+        if label:
+            return f"点击后跳转到“{label}”对应页面。"
+        return "点击后触发页面跳转。"
+
+    return None
