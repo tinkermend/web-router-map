@@ -2,6 +2,7 @@
 
 ## 2026-03-11
 
+- 修复 `AuthCrawler._wait_login_success` 认证成功判定误报：移除“仍在登录页但仅凭 cookie/token 信号即判定成功”的分支，改为必须先离开登录页，避免未登录态被错误持久化。
 - 修复 `crawl-menu-map.py` 在 history 路由场景下的 URL 组装：`_build_url_from_route` 现在按 `origin + route_path` 构造目标地址，避免错误拼接为 `.../dashboard/...` 导致页面抓取偏移。
 - 修复 `crawl-menu-map.py` 的登录态校验回归：`_is_state_valid` 在 URL 判定之外恢复登录表单特征识别，避免“无 `/login` 路径但实际处于登录页”被误判为有效会话。
 - 调整 `AuthService._save_state` 的 `storage_states` 持久化策略：优先更新同一 `web_system` 的已有会话记录（`update`），仅在首次无记录时兜底创建，避免持续插入历史 token 快照。

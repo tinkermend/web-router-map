@@ -95,9 +95,11 @@ async def test_wait_login_success_uses_wait_for_function():
     await ac._wait_login_success(page, 12_000, login_url="https://demo.example.com/#/auth/login")
 
     assert len(page.calls) == 1
-    _, payload, timeout = page.calls[0]
+    script, payload, timeout = page.calls[0]
     assert timeout == 12_000
     assert payload["login_fragment"] == "auth/login"
+    assert "return awayFromLogin;" in script
+    assert "hasCookieSignal" not in script
 
 
 @pytest.mark.asyncio

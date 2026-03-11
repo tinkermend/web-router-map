@@ -243,8 +243,6 @@ async def _wait_login_success(page: Page, timeout_ms: int, *, login_url: str) ->
         const loginUrl = String(args.login_url || "").toLowerCase();
         const loginPath = String(args.login_path || "").toLowerCase();
         const loginFragment = String(args.login_fragment || "").toLowerCase();
-        const tokenKeys = Array.isArray(args.token_keys) ? args.token_keys : [];
-        const cookieHints = Array.isArray(args.cookie_hints) ? args.cookie_hints : [];
 
         const sameOrigin = !expectedOrigin || origin === expectedOrigin;
         const genericLoginPattern = /(^|[#/?&])login([/?&#]|$)/i;
@@ -257,33 +255,7 @@ async def _wait_login_success(page: Page, timeout_ms: int, *, login_url: str) ->
             genericLoginPattern.test(href);
 
         const awayFromLogin = sameOrigin && !stillLoginPage;
-
-        const hasStorageToken = [window.localStorage, window.sessionStorage].some((storage) => {
-            if (!storage) return false;
-            for (let i = 0; i < storage.length; i += 1) {
-                const key = String(storage.key(i) || "").toLowerCase();
-                if (!key) continue;
-                const value = String(storage.getItem(key) || "").trim();
-                if (!value) continue;
-                if (tokenKeys.includes(key)) return true;
-            }
-            return false;
-        });
-
-        const hasCookieSignal = (() => {
-            const cookieText = String(document.cookie || "");
-            if (!cookieText) return false;
-            const cookieNames = cookieText
-                .split(";")
-                .map((item) => item.split("=")[0])
-                .map((name) => String(name || "").trim().toLowerCase())
-                .filter(Boolean);
-            return cookieNames.some((name) =>
-                cookieHints.some((hint) => name === hint || name.endsWith(`_${hint}`) || name.endsWith(`-${hint}`))
-            );
-        })();
-
-        return awayFromLogin || (sameOrigin && (hasStorageToken || hasCookieSignal));
+        return awayFromLogin;
     }"""
     payload = _build_login_wait_payload(login_url)
     try:
