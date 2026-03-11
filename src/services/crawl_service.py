@@ -33,7 +33,7 @@ from src.services.crypto_service import CryptoService
 from src.services.task_tracker import TaskTracker
 
 DEFAULT_HOME_PATH = "#/analytics"
-DEFAULT_MAX_PAGES = 10
+DEFAULT_MAX_PAGES = 30
 DEFAULT_MAX_ELEMENTS_PER_PAGE = 180
 DEFAULT_MAX_MODAL_TRIGGERS = 8
 DEFAULT_EXPAND_ROUNDS = 6
@@ -348,6 +348,13 @@ class CrawlService:
                         .where(WebSystem.id == system.id)
                         .values(last_crawl_at=now, updated_at=now)
                     )
+                    # Snapshot unchanged means crawl verification succeeded;
+                    # refresh page-level crawled_at to prevent stale-context false positives.
+                    await self.session.exec(
+                        update(AppPage)
+                        .where(AppPage.system_id == system.id)
+                        .values(crawled_at=now, updated_at=now)
+                    )
                     await self.session.commit()
                     snapshot_counts = await self._current_snapshot_counts(system.id)
 
@@ -503,8 +510,12 @@ class CrawlService:
                 )
 
         existing_menus_by_identity: dict[tuple[str, str, str, str], list[NavMenu]] = defaultdict(list)
+        existing_menus_by_route_path: dict[str, list[NavMenu]] = defaultdict(list)
         for menu in existing_menus:
             existing_menus_by_identity[_menu_identity_from_model(menu)].append(menu)
+            route_path = _normalize_route_path(menu.route_path)
+            if route_path:
+                existing_menus_by_route_path[route_path].append(menu)
 
         node_id_map: dict[str, UUID] = {}
         menu_models_by_id: dict[UUID, NavMenu] = {}
@@ -512,9 +523,22 @@ class CrawlService:
         route_name_by_menu_id: dict[UUID, str | None] = {}
         pending_node_paths: dict[UUID, str] = {}
         for index, node in enumerate(menus, start=1):
-            identity = _menu_identity_from_payload(node, default_index=index)
-            candidates = existing_menus_by_identity.get(identity, [])
-            menu_model = candidates.pop(0) if candidates else None
+            route_path = _normalize_route_path(node.get("route_path"))
+            menu_model: NavMenu | None = None
+            if route_path:
+                route_candidates = existing_menus_by_route_path.get(route_path, [])
+                if route_candidates:
+                    menu_model = route_candidates.pop(0)
+                    matched_identity = _menu_identity_from_model(menu_model)
+                    identity_candidates = existing_menus_by_identity.get(matched_identity, [])
+                    if menu_model in identity_candidates:
+                        identity_candidates.remove(menu_model)
+
+            if menu_model is None:
+                identity = _menu_identity_from_payload(node, default_index=index)
+                candidates = existing_menus_by_identity.get(identity, [])
+                menu_model = candidates.pop(0) if candidates else None
+
             if menu_model is None:
                 menu_model = NavMenu(system_id=system_id, title="")
                 self.session.add(menu_model)

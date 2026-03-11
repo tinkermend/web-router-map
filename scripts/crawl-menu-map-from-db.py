@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sys-code", required=True, help="Target system code from web_systems.sys_code")
     parser.add_argument("--home-url", default="", help="Override crawl home url")
     parser.add_argument("--menu-selector", default="", help="Optional explicit menu selector")
-    parser.add_argument("--max-pages", type=int, default=10, help="Max pages to crawl")
+    parser.add_argument("--max-pages", type=int, default=30, help="Max pages to crawl")
     parser.add_argument("--max-elements-per-page", type=int, default=180, help="Max elements per page")
     parser.add_argument("--max-modal-triggers", type=int, default=8, help="Max modal trigger attempts per page")
     parser.add_argument("--expand-rounds", type=int, default=6, help="DOM menu expand rounds")

@@ -11,6 +11,11 @@
 - 修复 `crawl-menu-map.py` 的登录态校验回归：`_is_state_valid` 在 URL 判定之外恢复登录表单特征识别，避免“无 `/login` 路径但实际处于登录页”被误判为有效会话。
 - 调整 `AuthService._save_state` 的 `storage_states` 持久化策略：优先更新同一 `web_system` 的已有会话记录（`update`），仅在首次无记录时兜底创建，避免持续插入历史 token 快照。
 - 新增单测覆盖 `storage_states` 复用场景，验证连续保存认证状态时不会新增多条记录，并保持 `web_systems.latest_valid_state_id` 指向同一会话记录。
+- 修复 `CrawlService.run_by_sys_code` 在“payload 未变化”分支的数据新鲜度更新缺失：现在会同步刷新 `app_pages.crawled_at`（以及 `updated_at`），避免重复采集成功却被 MCP 误判 `need_recrawl`（`stale_context`）；并新增单测覆盖该分支时间戳刷新行为。
+- 修复 `scripts/crawl-menu-map.py` 在同步 Playwright 运行时向 `page.evaluate()` 误传 `timeout` 参数导致的路由提取异常：恢复框架探测与 Vue/React 运行时路由注入提取，避免退化到仅 `menu_observe` 的少量页面采集；新增单测覆盖 `evaluate` 参数透传回归。
+- 修复 `scripts/crawl-menu-map.py` 元素提取阶段的选择器构造异常：`label[for=...]` 现在对动态 `id` 执行 CSS 转义，避免包含 `{}`/引号等特殊字符时触发 `Page.evaluate` 语法错误并中断整次采集；新增单测覆盖转义逻辑。
+- 修复 `CrawlService._persist_payload` 菜单 upsert 的唯一键冲突：新增“按 `route_path` 优先复用历史 `nav_menus` 记录”策略，避免菜单层级/面包屑变动时误判为新节点并触发 `(system_id, route_path)` 重复插入；新增数据库单测覆盖该复用场景。
+- 调整菜单采集默认 `max_pages` 从 `10` 提升到 `30`（`CrawlService` 与两条 CLI 入口同步），减少默认任务对二级/深层页面的截断漏采。
 
 ## 2026-03-10
 

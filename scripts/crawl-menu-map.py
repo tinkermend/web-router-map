@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=10,
+        default=30,
         help="Max number of page URLs to crawl for element collection.",
     )
     parser.add_argument(
@@ -482,7 +482,6 @@ def _detect_framework(page, *, framework_hint: str = "auto", timeout_ms: int = 8
             scores.react = Math.min(1, scores.react);
             return { scores, evidence };
         }""",
-        timeout=timeout_ms,
     )
     selected = _select_framework(detected.get("scores") or {}, framework_hint=framework_hint)
     selected["evidence"] = detected.get("evidence") or {}
@@ -555,7 +554,6 @@ def _extract_vue3_routes_runtime(page, app_base_url: str, home_url: str, timeout
             }
             return out;
         }""",
-        timeout=timeout_ms,
     )
     data["routes"] = _normalize_route_records(
         data.get("routes") or [],
@@ -636,7 +634,6 @@ def _extract_vue2_routes_runtime(page, app_base_url: str, home_url: str, timeout
             }
             return out;
         }""",
-        timeout=timeout_ms,
     )
     data["routes"] = _normalize_route_records(
         data.get("routes") or [],
@@ -725,7 +722,6 @@ def _extract_react_routes_runtime(page, app_base_url: str, home_url: str, timeou
             out.success = out.routes.length > 0;
             return out;
         }""",
-        timeout=timeout_ms,
     )
     data["routes"] = _normalize_route_records(
         data.get("routes") or [],
@@ -1231,6 +1227,14 @@ def _extract_elements(page, root_selector: str | None, limit: int) -> list[dict[
             ];
 
             const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim();
+            const cssEscape = (value) => {
+                const text = String(value || '');
+                if (!text) return '';
+                if (window.CSS && typeof window.CSS.escape === 'function') {
+                    return window.CSS.escape(text);
+                }
+                return text.replace(/([\\\\\"'\\[\\]#.:>+~(){}])/g, '\\\\$1');
+            };
             const visible = (el) => {
                 if (!(el instanceof Element)) return false;
                 const rect = el.getBoundingClientRect();
@@ -1277,10 +1281,13 @@ def _extract_elements(page, root_selector: str | None, limit: int) -> list[dict[
                 const aria = normalize(el.getAttribute('aria-label') || '');
                 if (aria) return aria;
                 if (el.id) {
-                    const label = document.querySelector(`label[for=\"${el.id}\"]`);
-                    if (label) {
-                        const t = normalize(label.textContent || '');
-                        if (t) return t;
+                    const escapedId = cssEscape(el.id);
+                    if (escapedId) {
+                        const label = document.querySelector(`label[for=\"${escapedId}\"]`);
+                        if (label) {
+                            const t = normalize(label.textContent || '');
+                            if (t) return t;
+                        }
                     }
                 }
                 const parent = el.parentElement;

@@ -20,6 +20,16 @@ def _load_script_module():
 crawl_script = _load_script_module()
 
 
+class _FakeEvaluatePage:
+    def __init__(self, result):
+        self.result = result
+        self.calls: list[dict[str, object]] = []
+
+    def evaluate(self, script, *args, **kwargs):
+        self.calls.append({"script": script, "args": args, "kwargs": kwargs})
+        return self.result
+
+
 def test_select_framework_confidence_levels():
     chosen = crawl_script._select_framework({"vue2": 0.2, "vue3": 0.8, "react": 0.1})
     assert chosen["framework_type"] == "vue3"
@@ -136,3 +146,57 @@ def test_compute_coverage_score_and_failure_categories():
         "page_crawl_partial",
         "payload_low_confidence",
     ]
+
+
+def test_detect_framework_does_not_forward_timeout_to_evaluate():
+    page = _FakeEvaluatePage(
+        {
+            "scores": {"vue2": 0.1, "vue3": 0.9, "react": 0.1},
+            "evidence": {"vue3": ["window.__VUE_ROUTER__.getRoutes"]},
+        }
+    )
+
+    result = crawl_script._detect_framework(page, framework_hint="auto", timeout_ms=1234)
+
+    assert result["framework_type"] == "vue3"
+    assert len(page.calls) == 1
+    assert page.calls[0]["kwargs"] == {}
+
+
+def test_extract_vue3_routes_runtime_does_not_forward_timeout_to_evaluate():
+    page = _FakeEvaluatePage(
+        {
+            "success": True,
+            "source": "vue3_runtime",
+            "routes": [
+                {"route_path": "/system/user", "route_name": "systemUser", "title": "用户管理"}
+            ],
+            "error": None,
+            "probe_chain": ["window.__VUE_ROUTER__"],
+        }
+    )
+
+    result = crawl_script._extract_vue3_routes_runtime(
+        page,
+        app_base_url="https://demo.example.com",
+        home_url="https://demo.example.com/#/dashboard",
+        timeout_ms=1234,
+    )
+
+    assert result["success"] is True
+    assert result["routes"][0]["target_url"] == "https://demo.example.com/#/system/user"
+    assert len(page.calls) == 1
+    assert page.calls[0]["kwargs"] == {}
+
+
+def test_extract_elements_escapes_label_selector_for_dynamic_id():
+    page = _FakeEvaluatePage([])
+
+    result = crawl_script._extract_elements(page, None, 20)
+
+    assert result == []
+    assert len(page.calls) == 1
+    script = str(page.calls[0]["script"])
+    assert "cssEscape" in script
+    assert "const escapedId = cssEscape(el.id);" in script
+    assert "label[for" in script

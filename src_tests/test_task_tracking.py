@@ -12,8 +12,10 @@ from sqlmodel import select
 
 from src.config.settings import get_settings
 from src.crawler.auth_crawler import AuthCapture
+from src.models.app_page import AppPage
 from src.models.crawl_log import CrawlLog
 from src.models.database import close_db, get_session_factory, init_db, ping_db, session_scope
+from src.models.nav_menu import NavMenu
 from src.models.storage_state import StorageState
 from src.models.web_system import WebSystem
 from src.scheduler.locks import distributed_lock
@@ -319,6 +321,18 @@ async def test_crawl_service_skips_persist_when_payload_unchanged(tmp_path: Path
         ],
     }
     payload_fp = _build_payload_fingerprint(payload)
+    old_crawled_at = datetime.now(timezone.utc) - timedelta(days=10)
+
+    async with session_scope() as session:
+        page = AppPage(
+            system_id=system.id,
+            url_pattern="/analytics",
+            crawled_at=old_crawled_at,
+            is_crawled=True,
+        )
+        session.add(page)
+        await session.flush()
+        existing_page_id = page.id
 
     async with session_scope() as session:
         service = CrawlService(session)
@@ -355,6 +369,11 @@ async def test_crawl_service_skips_persist_when_payload_unchanged(tmp_path: Path
     assert log.changed is False
     assert log.pages_found == 6
     assert log.elements_found == 52
+    async with session_scope() as session:
+        refreshed_page = await session.get(AppPage, existing_page_id)
+    assert refreshed_page is not None
+    assert refreshed_page.crawled_at is not None
+    assert refreshed_page.crawled_at > old_crawled_at
 
 
 @pytest.mark.asyncio
@@ -474,3 +493,65 @@ async def test_crawl_service_strict_mode_fails_low_confidence_payload(tmp_path: 
     assert result.degraded is True
     assert result.quality_score == 0.1
     assert "Strict mode rejected" in result.message
+
+
+@pytest.mark.asyncio
+async def test_persist_payload_reuses_existing_menu_row_by_route_path():
+    if not await ping_db():
+        pytest.skip("PostgreSQL is not reachable in current environment.")
+
+    system = await _create_system(with_credentials=True)
+
+    async with session_scope() as session:
+        existing_menu = NavMenu(
+            system_id=system.id,
+            title="旧菜单",
+            text_breadcrumb="旧路径 > 关于我们",
+            menu_order=9,
+            menu_level=2,
+            path_indexes=[9, 9],
+            node_type="page",
+            target_url=f"{system.base_url}/#/layout/about",
+            route_path="/layout/about",
+            source="dom",
+        )
+        session.add(existing_menu)
+        await session.flush()
+        existing_menu_id = existing_menu.id
+
+    payload = {
+        "meta": {"state_valid": True},
+        "menus": [
+            {
+                "node_id": "menu-1",
+                "title": "关于我们",
+                "text_breadcrumb": "控制台路由 > 关于我们",
+                "menu_order": 1,
+                "menu_level": 1,
+                "path_indexes": [1],
+                "node_type": "page",
+                "target_url": f"{system.base_url}/#/layout/about",
+                "route_path": "/layout/about",
+                "source": "vue3_runtime",
+            }
+        ],
+        "pages": [],
+    }
+
+    async with session_scope() as session:
+        service = CrawlService(session)
+        result = await service._persist_payload(system.id, payload)
+        assert result["menus_saved"] == 1
+
+    async with session_scope() as session:
+        menus = (
+            await session.exec(
+                select(NavMenu)
+                .where(NavMenu.system_id == system.id, NavMenu.route_path == "/layout/about")
+            )
+        ).all()
+
+    assert len(menus) == 1
+    assert menus[0].id == existing_menu_id
+    assert menus[0].title == "关于我们"
+    assert menus[0].source == "vue3_runtime"
