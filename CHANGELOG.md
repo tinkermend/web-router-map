@@ -2,6 +2,9 @@
 
 ## 2026-03-11
 
+- 优化 `scripts/crawl-menu-map.py` 辅助定位器生成逻辑：元素采集默认采用 `get_by_test_id/get_by_role/get_by_label/get_by_placeholder/get_by_text` 的现代 Playwright 定位策略，新增动态 ID（如 `#el-id-*`）识别与过滤，停止将动态 `id` 作为高优先推荐定位器；同步增强 `_click_by_locator` 对新定位器语法的兼容。
+- 优化 `mcp-server/src/menu_context_mcp/repository.py` 定位器检索噪声过滤：对非现代 Playwright 表达式中的动态 ID 选择器（如 `#el-id-*`）进行拦截，降低历史存量脏定位器对页面健康检测的干扰。
+- 新增单测 `src_tests/test_mcp_repository_locator_noise.py` 与扩展 `src_tests/test_crawl_menu_map_script.py`，覆盖动态 ID 过滤与现代定位器优先级评分行为。
 - 优化 `playwright-script-generator/scripts/generate_and_run.py`（及仓库镜像脚本 `scripts/generate_and_run.py`）页面关键词处理：新增轻量 `extract_page_keyword`，可从自然语言整句中提取叶子页面词（如从“超级管理员下的菜单管理页面数据表格是否正常展现”提取“菜单管理”），并在调用 MCP 前自动归一化关键词。
 - 修复 `scripts/generate_and_run.py` 的兼容性回归：恢复 `parse_args`/`parse_dialogues`/`_parse_locator`/`_pick_home_locator`/`_normalize_dialogue_text` 等模块级入口，避免被单测与外部调用方导入时触发 `AttributeError`。
 - 修复 `scripts/generate_and_run.py` 的 route-only 检测误判：当 `target_url` 为空但 `route_path` 或 `navigation_plan` 可用时不再提前报错，改为继续执行菜单链路与运行时路由回退。

@@ -50,6 +50,12 @@ PHASE_ERROR_CODES = {
     "dom_extract": "menu_extract_failed",
     "merge_score": "merge_score_failed",
 }
+_LOCATOR_GET_BY_VALUE_RE = re.compile(r"""^get_by_(text|label|placeholder|test_id)\((["'])(.+?)\2\)$""")
+_LOCATOR_GET_BY_ROLE_WITH_NAME_RE = re.compile(
+    r"""^get_by_role\((["'])(.+?)\1\s*,\s*name\s*=\s*(["'])(.+?)\3\)$"""
+)
+_LOCATOR_GET_BY_ROLE_RE = re.compile(r"""^get_by_role\((["'])(.+?)\1\)$""")
+_LOCATOR_RAW_LOCATOR_RE = re.compile(r"""^locator\((["'])(.+?)\1\)$""")
 
 
 def parse_args() -> argparse.Namespace:
@@ -1227,6 +1233,7 @@ def _extract_elements(page, root_selector: str | None, limit: int) -> list[dict[
             ];
 
             const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim();
+            const escapeForLocator = (value) => String(value || '').replace(/\\\\/g, '\\\\\\\\').replace(/'/g, \"\\\\'\");
             const cssEscape = (value) => {
                 const text = String(value || '');
                 if (!text) return '';
@@ -1234,6 +1241,33 @@ def _extract_elements(page, root_selector: str | None, limit: int) -> list[dict[
                     return window.CSS.escape(text);
                 }
                 return text.replace(/([\\\\\"'\\[\\]#.:>+~(){}])/g, '\\\\$1');
+            };
+            const isDynamicToken = (value) => {
+                const token = normalize(value).toLowerCase();
+                if (!token) return false;
+                if (/^[a-f0-9]{8,}$/.test(token)) return true;
+                if (/\\d{4,}/.test(token)) return true;
+                if (/(?:^|[-_:])(\\d{3,})(?:$|[-_:])/.test(token)) return true;
+                if (/^[a-z0-9_-]{2,}__[a-z0-9_-]{6,}$/i.test(token)) return true;
+                return false;
+            };
+            const isDynamicId = (value) => {
+                const id = normalize(value).toLowerCase();
+                if (!id) return false;
+                if (/^el-id-\\d+(?:-\\d+)?$/.test(id)) return true;
+                if (/^:r\\d+:/.test(id)) return true;
+                if (/^headlessui-[\\w-]*-\\d+$/.test(id)) return true;
+                if (/^radix-[\\w-]*-\\d+$/.test(id)) return true;
+                if (/^[a-f0-9]{10,}$/.test(id)) return true;
+                if (isDynamicToken(id)) return true;
+                return false;
+            };
+            const stableClassNames = (el) => {
+                if (!el.classList) return [];
+                return Array.from(el.classList)
+                    .map((item) => normalize(item))
+                    .filter((item) => item && !isDynamicToken(item))
+                    .slice(0, 2);
             };
             const visible = (el) => {
                 if (!(el instanceof Element)) return false;
@@ -1248,13 +1282,15 @@ def _extract_elements(page, root_selector: str | None, limit: int) -> list[dict[
                 let cur = el;
                 while (cur && cur.nodeType === 1 && parts.length < 7) {
                     let part = cur.tagName.toLowerCase();
-                    if (cur.id) {
-                        part += `#${cur.id}`;
+                    const rawId = normalize(cur.getAttribute('id') || '');
+                    if (rawId && !isDynamicId(rawId)) {
+                        part += `#${cssEscape(rawId)}`;
                         parts.unshift(part);
                         break;
                     }
-                    if (cur.classList && cur.classList.length) {
-                        part += '.' + Array.from(cur.classList).slice(0, 2).join('.');
+                    const classes = stableClassNames(cur);
+                    if (classes.length) {
+                        part += '.' + classes.map((item) => cssEscape(item)).join('.');
                     }
                     const parent = cur.parentElement;
                     if (parent) {
@@ -1277,11 +1313,12 @@ def _extract_elements(page, root_selector: str | None, limit: int) -> list[dict[
                 return 'interactive';
             };
 
-            const nearbyText = (el) => {
+            const resolveControlLabel = (el) => {
                 const aria = normalize(el.getAttribute('aria-label') || '');
                 if (aria) return aria;
-                if (el.id) {
-                    const escapedId = cssEscape(el.id);
+                const rawId = normalize(el.getAttribute('id') || '');
+                if (rawId) {
+                    const escapedId = cssEscape(rawId);
                     if (escapedId) {
                         const label = document.querySelector(`label[for=\"${escapedId}\"]`);
                         if (label) {
@@ -1290,6 +1327,17 @@ def _extract_elements(page, root_selector: str | None, limit: int) -> list[dict[
                         }
                     }
                 }
+                const wrappingLabel = el.closest('label');
+                if (wrappingLabel) {
+                    const t = normalize(wrappingLabel.textContent || '');
+                    if (t) return t;
+                }
+                return '';
+            };
+
+            const nearbyText = (el) => {
+                const labelText = resolveControlLabel(el);
+                if (labelText) return labelText;
                 const parent = el.parentElement;
                 if (parent) {
                     const t = normalize(parent.textContent || '');
@@ -1310,27 +1358,50 @@ def _extract_elements(page, root_selector: str | None, limit: int) -> list[dict[
                 seen.add(path);
 
                 const text = normalize(el.innerText || el.textContent || '');
+                const stableId = (() => {
+                    const rawId = normalize(el.getAttribute('id') || '');
+                    return rawId && !isDynamicId(rawId) ? rawId : null;
+                })();
+                const controlLabel = resolveControlLabel(el);
                 const attrs = {
-                    id: el.getAttribute('id') || null,
+                    id: stableId,
                     class: el.getAttribute('class') || null,
                     name: el.getAttribute('name') || null,
                     placeholder: el.getAttribute('placeholder') || null,
                     'aria-label': el.getAttribute('aria-label') || null,
                     'data-testid': el.getAttribute('data-testid') || null,
+                    'data-qa': el.getAttribute('data-qa') || el.getAttribute('data-test') || el.getAttribute('data-cy') || null,
                     role: el.getAttribute('role') || null,
                     type: el.getAttribute('type') || null,
                 };
                 const role = attrs.role || '';
-                const locatorText = (text || attrs['aria-label'] || attrs.placeholder || '').replace(/'/g, \"\\\\'\");
+                const isFormControl = ['input', 'select', 'textarea'].includes(el.tagName.toLowerCase());
+                const locatorText = escapeForLocator(text || attrs['aria-label'] || controlLabel || '');
+                const labelText = escapeForLocator(controlLabel || '');
+                const placeholderText = escapeForLocator(attrs.placeholder || '');
+                const roleText = escapeForLocator(role || '');
+                const testIdText = escapeForLocator(attrs['data-testid'] || '');
+                const dataQaText = cssEscape(attrs['data-qa'] || '');
 
                 const strategies = {};
-                if (attrs['data-testid']) strategies.priority_1 = `[data-testid=\"${attrs['data-testid']}\"]`;
-                else if (attrs.id) strategies.priority_1 = `#${attrs.id}`;
-                if (role && locatorText) strategies.priority_2 = `get_by_role('${role}', name='${locatorText}')`;
-                if (locatorText) strategies.priority_3 = `get_by_text('${locatorText}')`;
-                strategies.priority_4 = path;
+                if (testIdText) {
+                    strategies.priority_1 = `get_by_test_id('${testIdText}')`;
+                } else if (dataQaText) {
+                    strategies.priority_1 = `[data-qa=\"${dataQaText}\"]`;
+                }
+                if (role && locatorText) strategies.priority_2 = `get_by_role('${roleText}', name='${locatorText}')`;
+                if (isFormControl && labelText) strategies.priority_3 = `get_by_label('${labelText}')`;
+                if (isFormControl && placeholderText) strategies.priority_4 = `get_by_placeholder('${placeholderText}')`;
+                if (locatorText && !isFormControl) strategies.priority_5 = `get_by_text('${locatorText}')`;
+                strategies.priority_6 = path;
 
-                const recommended = strategies.priority_1 || strategies.priority_2 || strategies.priority_3 || path;
+                const recommended =
+                    strategies.priority_1
+                    || strategies.priority_2
+                    || strategies.priority_3
+                    || strategies.priority_4
+                    || strategies.priority_5
+                    || path;
                 const rect = el.getBoundingClientRect();
                 out.push({
                     tag_name: el.tagName.toLowerCase(),
@@ -1360,25 +1431,29 @@ def _extract_elements(page, root_selector: str | None, limit: int) -> list[dict[
 
 def _infer_locator_tier_and_score(element: dict[str, Any]) -> tuple[str, float]:
     locator = str(element.get("playwright_locator") or "")
-    locators = element.get("locators") or {}
-    attrs = locators.get("attributes") or {}
 
-    if attrs.get("data-testid"):
+    if locator.startswith("get_by_test_id("):
         return "data_testid", 0.98
-    if attrs.get("id") and locator.startswith("#"):
-        return "id", 0.94
     if locator.startswith("[data-testid"):
         return "data_testid", 0.96
-    if locator.startswith("[") and attrs.get("id"):
-        return "attr", 0.88
+    if locator.startswith("[data-qa"):
+        return "data_attr", 0.9
+    if locator.startswith("get_by_label("):
+        return "label", 0.9
+    if locator.startswith("get_by_placeholder("):
+        return "placeholder", 0.86
     if locator.startswith("get_by_role("):
+        if "name=" in locator:
+            return "role", 0.92
         return "role", 0.84
     if locator.startswith("get_by_text("):
         return "text", 0.72
     if "nth-of-type" in locator or " > " in locator:
         return "css_path", 0.42
+    if locator.startswith("locator("):
+        return "locator_expr", 0.68
     if locator.startswith("#"):
-        return "css_id", 0.86
+        return "css_id", 0.52
     if locator:
         return "other", 0.58
     return "none", 0.0
@@ -1535,14 +1610,31 @@ def _click_by_locator(page, locator_text: str) -> bool:
     try:
         if locator_text.startswith("#") or ">" in locator_text or locator_text.startswith("["):
             locator = page.locator(locator_text).first
-        elif locator_text.startswith("get_by_text("):
-            match = re.search(r"get_by_text\('(.+)'\)", locator_text)
-            if match:
-                locator = page.get_by_text(match.group(1)).first
-        elif locator_text.startswith("get_by_role("):
-            role_match = re.search(r"get_by_role\('([^']+)'\s*,\s*name='([^']+)'\)", locator_text)
-            if role_match:
-                locator = page.get_by_role(role_match.group(1), name=role_match.group(2)).first
+        elif locator_text.startswith("locator("):
+            raw_locator_match = _LOCATOR_RAW_LOCATOR_RE.match(locator_text)
+            if raw_locator_match:
+                locator = page.locator(raw_locator_match.group(2)).first
+        else:
+            value_match = _LOCATOR_GET_BY_VALUE_RE.match(locator_text)
+            if value_match:
+                method = value_match.group(1)
+                value = value_match.group(3)
+                if method == "text":
+                    locator = page.get_by_text(value).first
+                elif method == "label":
+                    locator = page.get_by_label(value).first
+                elif method == "placeholder":
+                    locator = page.get_by_placeholder(value).first
+                elif method == "test_id":
+                    locator = page.get_by_test_id(value).first
+            if locator is None:
+                role_match = _LOCATOR_GET_BY_ROLE_WITH_NAME_RE.match(locator_text)
+                if role_match:
+                    locator = page.get_by_role(role_match.group(2), name=role_match.group(4)).first
+            if locator is None:
+                role_only_match = _LOCATOR_GET_BY_ROLE_RE.match(locator_text)
+                if role_only_match:
+                    locator = page.get_by_role(role_only_match.group(2)).first
         if locator is None:
             return False
         if locator.count() < 1:

@@ -28,6 +28,17 @@ class StorageStateRecord:
     expires_at: datetime | None
 
 _ALLOWED_ELEMENT_TYPES = ("action_btn", "form_input", "nav_link")
+_DYNAMIC_ID_LOCATOR_RE = re.compile(
+    r"#(?:el-id-\d+(?:-\d+)?|:r\d+:?[a-z0-9_-]*|headlessui-[\w-]*-\d+|radix-[\w-]*-\d+|[a-f0-9]{10,}|[a-z0-9_-]*\d{4,}[a-z0-9_-]*)\b",
+    flags=re.IGNORECASE,
+)
+_MODERN_PLAYWRIGHT_PREFIXES = (
+    "get_by_role(",
+    "get_by_text(",
+    "get_by_label(",
+    "get_by_placeholder(",
+    "get_by_test_id(",
+)
 
 _BASE_CANDIDATE_SQL = """
 SELECT
@@ -421,6 +432,11 @@ class ContextRepository:
 
     @staticmethod
     def _is_noise(locator: LocatorRecord) -> bool:
+        locator_expr = (locator.playwright_locator or "").strip()
+        if locator_expr and not locator_expr.startswith(_MODERN_PLAYWRIGHT_PREFIXES):
+            if _DYNAMIC_ID_LOCATOR_RE.search(locator_expr):
+                return True
+
         content = " ".join(
             filter(
                 None,

@@ -14,7 +14,6 @@
 为了实现高效且精确的抓取，系统优先采用“注入审查”模式，次选“仿真遍历”模式。
 
 - Console 实例探测提取 (首选方案):
-
   - Vue 环境: 通过 Playwright Page 注入 JS 脚本，探测 window.**VUE_ROUTER** (Vue3) 或分析根挂载实例 document.querySelector('#app').**vue**.$router.options.routes (Vue2)。一旦获取到路由配置对象，直接递归解析生成完整的路由结构。
   - React 环境: 探测 React DevTools 暴露的全局钩子 **REACT_DEVTOOLS_GLOBAL_HOOK** 或根节点 \_reactRootContainer，解析其 Fiber 树提取内部定义的 Routes。
 
@@ -24,5 +23,6 @@
 
 - 每次开发完成进行单元测试
 - 每一次变更都变更总结到 CHANGELOG.md 中
+- 菜单数据采集基于 Playwright 现代稳定策略（角色、文本、结构语义、属性）, 不要采集动态ID数据
 
 项目启动命令: uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 --workers 1

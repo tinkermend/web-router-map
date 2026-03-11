@@ -198,5 +198,33 @@ def test_extract_elements_escapes_label_selector_for_dynamic_id():
     assert len(page.calls) == 1
     script = str(page.calls[0]["script"])
     assert "cssEscape" in script
-    assert "const escapedId = cssEscape(el.id);" in script
+    assert "const escapedId = cssEscape(rawId);" in script
     assert "label[for" in script
+
+
+def test_extract_elements_filters_dynamic_id_and_prefers_modern_locators():
+    page = _FakeEvaluatePage([])
+
+    crawl_script._extract_elements(page, None, 20)
+
+    script = str(page.calls[0]["script"])
+    assert "const isDynamicId" in script
+    assert "if (rawId && !isDynamicId(rawId))" in script
+    assert "get_by_test_id" in script
+    assert "get_by_label" in script
+    assert "get_by_placeholder" in script
+    assert "strategies.priority_1 = `#${attrs.id}`" not in script
+
+
+def test_infer_locator_tier_for_modern_playwright_locators():
+    tier, score = crawl_script._infer_locator_tier_and_score({"playwright_locator": "get_by_test_id('menu-table')"})
+    assert tier == "data_testid"
+    assert score >= 0.95
+
+    tier, score = crawl_script._infer_locator_tier_and_score({"playwright_locator": "get_by_label('展示名称')"})
+    assert tier == "label"
+    assert score >= 0.9
+
+    tier, score = crawl_script._infer_locator_tier_and_score({"playwright_locator": "get_by_placeholder('请输入关键字')"})
+    assert tier == "placeholder"
+    assert score >= 0.85
