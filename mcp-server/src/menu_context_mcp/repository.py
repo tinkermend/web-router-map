@@ -3,12 +3,29 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Sequence
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from menu_context_mcp.schemas import ContextQuery, LocatorRecord, PageCandidate, StageName, SystemRecord
+
+
+@dataclass(slots=True)
+class StorageStateRecord:
+    """Storage state record from database."""
+    id: str
+    system_id: str
+    storage_state: dict
+    cookies: list
+    local_storage: dict
+    session_storage: dict
+    auth_mode: str | None
+    is_valid: bool
+    validated_at: datetime | None
+    expires_at: datetime | None
 
 _ALLOWED_ELEMENT_TYPES = ("action_btn", "form_input", "nav_link")
 
@@ -348,6 +365,49 @@ class ContextRepository:
             return False
         noise_tokens = ("header", "sidebar", "theme", "account", "avatar", "profile")
         return any(token in content for token in noise_tokens)
+
+    async def fetch_valid_storage_state(
+        self,
+        session: AsyncSession,
+        system_id: str,
+    ) -> StorageStateRecord | None:
+        """Fetch the current valid storage state for a system."""
+        sql = text(
+            """
+            SELECT
+                ss.id,
+                ss.system_id,
+                ss.storage_state,
+                ss.cookies,
+                ss.local_storage,
+                ss.session_storage,
+                ss.auth_mode,
+                ss.is_valid,
+                ss.validated_at,
+                ss.expires_at
+            FROM storage_states AS ss
+            WHERE ss.system_id = :system_id
+              AND ss.is_valid IS TRUE
+            ORDER BY ss.validated_at DESC NULLS LAST, ss.created_at DESC
+            LIMIT 1
+            """
+        )
+        row = (await session.execute(sql, {"system_id": system_id})).mappings().first()
+        if row is None:
+            return None
+
+        return StorageStateRecord(
+            id=str(row["id"]),
+            system_id=str(row["system_id"]),
+            storage_state=row["storage_state"] or {},
+            cookies=row["cookies"] or [],
+            local_storage=row["local_storage"] or {},
+            session_storage=row["session_storage"] or {},
+            auth_mode=row["auth_mode"],
+            is_valid=bool(row["is_valid"]),
+            validated_at=row["validated_at"],
+            expires_at=row["expires_at"],
+        )
 
 
 def dedupe_candidates(candidates: Sequence[PageCandidate]) -> list[PageCandidate]:

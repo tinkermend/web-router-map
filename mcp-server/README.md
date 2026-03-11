@@ -213,6 +213,104 @@ MCP_TRANSPORT=streamable-http MCP_HOST=0.0.0.0 MCP_PORT=8765 menu-context-mcp
 
 ---
 
+### 3. `get_storage_state_for_session`（会话复用）
+
+获取浏览器存储状态（cookies、localStorage、sessionStorage），用于 Playwright 脚本跳过登录，直接复用已有会话。
+
+#### 入参
+
+| 参数          | 类型   | 必填   | 默认值 | 说明                                  |
+| ------------- | ------ | ------ | ------ | ------------------------------------- |
+| `system_name` | string | **是** | -      | 系统名称（模糊匹配 web_systems.name） |
+
+#### 出参
+
+```json
+{
+  "status": "ok",
+  "system": {
+    "sys_code": "erp_sys_a",
+    "name": "A系统-内部ERP",
+    "base_url": "https://erp.example.com",
+    "framework_type": "vue3",
+    "health_status": "online",
+    "state_valid": true
+  },
+  "state": {
+    "cookies": [
+      {
+        "name": "session_id",
+        "value": "xxx",
+        "domain": "erp.example.com",
+        "path": "/",
+        "httpOnly": true,
+        "secure": true
+      }
+    ],
+    "storage_state": {
+      "cookies": [...],
+      "origins": [
+        {
+          "origin": "https://erp.example.com",
+          "localStorage": [
+            { "name": "token", "value": "eyJhbGciOiJIUzI1NiIs..." }
+          ]
+        }
+      ]
+    },
+    "local_storage": {
+      "token": "eyJhbGciOiJIUzI1NiIs...",
+      "user_info": "{...}"
+    },
+    "session_storage": {}
+  },
+  "state_id": "uuid-xxx",
+  "is_valid": true,
+  "validated_at": "2024-01-15T10:30:00Z",
+  "expires_at": "2024-01-16T10:30:00Z",
+  "auth_mode": "bearer",
+  "reasons": [],
+  "usage_hint": "Use storage_state with browser.new_context(storage_state=response.state.storage_state); Navigate to https://erp.example.com after context creation to restore session"
+}
+```
+
+#### 状态码说明
+
+| status             | 说明                   |
+| ------------------ | ---------------------- |
+| `ok`               | 成功获取有效的存储状态 |
+| `system_not_found` | 未找到匹配的系统       |
+| `no_valid_state`   | 系统无有效的存储状态   |
+| `state_expired`    | 存储状态已过期         |
+
+#### Playwright 使用示例
+
+```python
+# 1. 调用 MCP tool 获取存储状态
+response = await mcp.call_tool("get_storage_state_for_session", {"system_name": "ERP"})
+
+# 2. 使用返回的 storage_state 创建浏览器上下文
+from playwright.async_api import async_playwright
+
+async with async_playwright() as p:
+    browser = await p.chromium.launch()
+
+    # 直接注入存储状态，跳过登录
+    context = await browser.new_context(
+        storage_state=response["state"]["storage_state"]
+    )
+
+    page = await context.new_page()
+
+    # 直接访问需要登录的页面
+    await page.goto(response["system"]["base_url"] + "/admin/users")
+
+    # 此时已处于登录状态，可直接操作
+    await page.get_by_role("button", name="新增用户").click()
+```
+
+---
+
 ## 检索策略
 
 ### 召回流程

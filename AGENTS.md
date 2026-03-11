@@ -23,3 +23,7 @@
 ## 强制约束
 
 - 每次开发完成进行单元测试
+
+
+
+项目启动命令:  uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 --workers 1

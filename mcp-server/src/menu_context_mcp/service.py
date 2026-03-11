@@ -19,6 +19,9 @@ from menu_context_mcp.schemas import (
     PageCandidate,
     PageContext,
     ScoredCandidate,
+    StorageStateContext,
+    StorageStateQuery,
+    StorageStateResponse,
     SystemContext,
     TraceItem,
 )
@@ -42,6 +45,8 @@ class RepositoryProtocol(Protocol):
     ): ...
 
     async def fetch_locators(self, session, *, page_id, min_stability_score: float, limit: int): ...
+
+    async def fetch_valid_storage_state(self, session, system_id: str): ...
 
 
 class ContextRetrievalService:
@@ -259,3 +264,86 @@ class ContextRetrievalService:
                 "trace": [item.model_dump(mode="json") for item in trace],
             },
         )
+
+    async def get_storage_state_for_session(self, query: StorageStateQuery) -> StorageStateResponse:
+        """Get storage state for Playwright session reuse."""
+        async with self.session_provider() as session:
+            system = await self.repository.resolve_system(session, query.system_name)
+            if system is None:
+                return StorageStateResponse(
+                    status="system_not_found",
+                    reasons=[f"No system found matching '{query.system_name}'"],
+                )
+
+            system_context = SystemContext(
+                sys_code=system.sys_code,
+                name=system.name,
+                base_url=system.base_url,
+                framework_type=system.framework_type,
+                health_status=system.health_status,
+                state_valid=system.health_status not in {"offline", "auth_failed"},
+            )
+
+            storage_state = await self.repository.fetch_valid_storage_state(session, str(system.id))
+            if storage_state is None:
+                return StorageStateResponse(
+                    status="no_valid_state",
+                    system=system_context,
+                    reasons=["No valid storage state found for this system", "Please run authentication first"],
+                )
+
+            now = datetime.now(timezone.utc)
+            if storage_state.expires_at and storage_state.expires_at < now:
+                return StorageStateResponse(
+                    status="state_expired",
+                    system=system_context,
+                    state_id=storage_state.id,
+                    is_valid=False,
+                    validated_at=storage_state.validated_at,
+                    expires_at=storage_state.expires_at,
+                    auth_mode=storage_state.auth_mode,
+                    reasons=["Storage state has expired", "Please run authentication to refresh"],
+                )
+
+            state_context = StorageStateContext(
+                cookies=storage_state.cookies,
+                storage_state=storage_state.storage_state,
+                local_storage=storage_state.local_storage,
+                session_storage=storage_state.session_storage,
+            )
+
+            log_retrieval_event(
+                "mcp_storage_state_retrieval",
+                {
+                    "system_name": query.system_name,
+                    "system_code": system.sys_code,
+                    "state_id": storage_state.id,
+                    "auth_mode": storage_state.auth_mode,
+                    "is_valid": storage_state.is_valid,
+                },
+            )
+
+            return StorageStateResponse(
+                status="ok",
+                system=system_context,
+                state=state_context,
+                state_id=storage_state.id,
+                is_valid=storage_state.is_valid,
+                validated_at=storage_state.validated_at,
+                expires_at=storage_state.expires_at,
+                auth_mode=storage_state.auth_mode,
+                reasons=[],
+                usage_hint=self._build_usage_hint(system.base_url, storage_state.auth_mode),
+            )
+
+    @staticmethod
+    def _build_usage_hint(base_url: str, auth_mode: str | None) -> str:
+        hints = [
+            "Use storage_state with browser.new_context(storage_state=response.state.storage_state)",
+            f"Navigate to {base_url} after context creation to restore session",
+        ]
+        if auth_mode == "bearer":
+            hints.append("For API calls, extract Authorization header from state.storage_state or use cookies")
+        elif auth_mode == "cookie_session":
+            hints.append("Session is cookie-based, storage_state injection should be sufficient")
+        return "; ".join(hints)

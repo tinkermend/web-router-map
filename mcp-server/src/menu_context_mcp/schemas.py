@@ -161,3 +161,45 @@ class ContextResponse(BaseModel):
     constraints: dict[str, Any] = Field(default_factory=dict)
     reasons: list[str] = Field(default_factory=list)
     debug_trace: list[TraceItem] | None = None
+
+
+# =============================================
+# Storage State Query Models
+# =============================================
+
+class StorageStateQuery(BaseModel):
+    """Query parameters for storage state retrieval."""
+
+    system_name: str = Field(min_length=1, max_length=200, description="System name keyword for fuzzy matching")
+
+    @model_validator(mode="after")
+    def _normalize(self) -> "StorageStateQuery":
+        self.system_name = self.system_name.strip()
+        return self
+
+
+class StorageStateContext(BaseModel):
+    """Storage state data for Playwright session reuse."""
+
+    cookies: list[dict[str, Any]] = Field(default_factory=list, description="Browser cookies")
+    storage_state: dict[str, Any] = Field(default_factory=dict, description="Playwright storage_state() snapshot")
+    local_storage: dict[str, Any] = Field(default_factory=dict, description="localStorage key-value pairs")
+    session_storage: dict[str, Any] = Field(default_factory=dict, description="sessionStorage key-value pairs")
+
+
+class StorageStateResponse(BaseModel):
+    """Response containing storage state for session reuse."""
+
+    status: Literal["ok", "system_not_found", "no_valid_state", "state_expired"]
+    system: SystemContext | None = None
+    state: StorageStateContext | None = None
+    state_id: str | None = None
+    is_valid: bool = False
+    validated_at: datetime | None = None
+    expires_at: datetime | None = None
+    auth_mode: str | None = None
+    reasons: list[str] = Field(default_factory=list)
+    usage_hint: str | None = Field(
+        default=None,
+        description="Hint for using this data in Playwright scripts (only present when status='ok')"
+    )
