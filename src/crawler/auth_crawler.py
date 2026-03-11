@@ -52,6 +52,14 @@ COOKIE_KEY_HINTS = (
     "auth",
     "access_token",
 )
+LOGIN_LOCATION_TOKENS = (
+    "login",
+    "signin",
+    "sign-in",
+    "auth/login",
+    "auth/signin",
+)
+LOGIN_LOCATION_RE = re.compile(r"(^|[^a-z0-9])(login|signin|sign-in)([^a-z0-9]|$)")
 
 SUPPORTED_LOGIN_AUTH_TYPES = {
     "captcha_slider",
@@ -222,14 +230,21 @@ async def _read_web_storage(page: Page, storage_name: str) -> dict[str, str]:
 
 
 def _build_login_wait_payload(login_url: str) -> dict[str, Any]:
-    parsed = urlsplit(str(login_url or "").strip().lower())
+    normalized_login_url = str(login_url or "").strip().lower()
+    parsed = urlsplit(normalized_login_url)
     fragment = (parsed.fragment or "").split("?", maxsplit=1)[0].strip().strip("/")
     path = (parsed.path or "").strip().rstrip("/")
+    path_is_login = _looks_like_login_location(path)
+    fragment_is_login = _looks_like_login_location(fragment)
+    login_url_prefix_enabled = path_is_login or fragment_is_login
     return {
         "expected_origin": _get_origin(login_url).lower(),
-        "login_url": str(login_url or "").strip().lower(),
+        "login_url": normalized_login_url,
         "login_path": path,
         "login_fragment": fragment,
+        "login_path_is_login": path_is_login,
+        "login_fragment_is_login": fragment_is_login,
+        "login_url_prefix_enabled": login_url_prefix_enabled,
         "token_keys": [key.lower() for key in TOKEN_KEYS],
         "cookie_hints": [key.lower() for key in COOKIE_KEY_HINTS],
     }
@@ -243,16 +258,21 @@ async def _wait_login_success(page: Page, timeout_ms: int, *, login_url: str) ->
         const loginUrl = String(args.login_url || "").toLowerCase();
         const loginPath = String(args.login_path || "").toLowerCase();
         const loginFragment = String(args.login_fragment || "").toLowerCase();
+        const loginPathIsLogin = Boolean(args.login_path_is_login);
+        const loginFragmentIsLogin = Boolean(args.login_fragment_is_login);
+        const loginUrlPrefixEnabled = Boolean(args.login_url_prefix_enabled);
 
         const sameOrigin = !expectedOrigin || origin === expectedOrigin;
         const genericLoginPattern = /(^|[#/?&])login([/?&#]|$)/i;
+        const genericSigninPattern = /(^|[#/?&])sign[-_]?in([/?&#]|$)/i;
         const stillLoginPage =
-            (loginUrl && href.startsWith(loginUrl)) ||
-            (loginFragment && href.includes(loginFragment)) ||
-            (loginPath && loginPath !== "/" && href.includes(loginPath)) ||
+            (loginUrlPrefixEnabled && loginUrl && href.startsWith(loginUrl)) ||
+            (loginFragmentIsLogin && loginFragment && href.includes(loginFragment)) ||
+            (loginPathIsLogin && loginPath && loginPath !== "/" && href.includes(loginPath)) ||
             href.includes("#/auth/login") ||
             href.includes("/auth/login") ||
-            genericLoginPattern.test(href);
+            genericLoginPattern.test(href) ||
+            genericSigninPattern.test(href);
 
         const awayFromLogin = sameOrigin && !stillLoginPage;
         return awayFromLogin;
@@ -264,6 +284,17 @@ async def _wait_login_success(page: Page, timeout_ms: int, *, login_url: str) ->
         raise RuntimeError(
             f"Login did not reach authenticated state within timeout. current_url={page.url}, login_url={login_url}"
         ) from exc
+
+
+def _looks_like_login_location(value: str) -> bool:
+    lowered = str(value or "").strip().lower().strip("/")
+    if not lowered:
+        return False
+    if any(token in lowered for token in ("auth/login", "auth/signin")):
+        return True
+    if LOGIN_LOCATION_RE.search(lowered):
+        return True
+    return any(lowered == token for token in LOGIN_LOCATION_TOKENS)
 
 
 async def _solve_login_challenge(

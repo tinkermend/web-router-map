@@ -16,6 +16,9 @@ from menu_context_mcp.schemas import (
     FreshnessContext,
     LocatorContext,
     LocatorRecord,
+    MenuNodeRecord,
+    NavigationPlan,
+    NavigationStep,
     PageCandidate,
     PageContext,
     ScoredCandidate,
@@ -45,6 +48,8 @@ class RepositoryProtocol(Protocol):
     ): ...
 
     async def fetch_locators(self, session, *, page_id, min_stability_score: float, limit: int): ...
+
+    async def fetch_navigation_chain(self, session, *, system_id: str, menu_id: str): ...
 
     async def fetch_valid_storage_state(self, session, system_id: str): ...
 
@@ -158,6 +163,11 @@ class ContextRetrievalService:
                     min_stability_score=min_stability,
                     limit=query.max_locators,
                 )
+            navigation_chain = await self.repository.fetch_navigation_chain(
+                session,
+                system_id=str(system.id),
+                menu_id=str(primary.candidate.menu_id),
+            )
 
             status = "ok"
             reasons: list[str] = []
@@ -180,6 +190,7 @@ class ContextRetrievalService:
                     state_valid=system.health_status not in {"offline", "auth_failed"},
                 ),
                 target_page=self._to_page_context(primary),
+                navigation_plan=self._build_navigation_plan(primary=primary, chain=navigation_chain),
                 locators=[self._to_locator_context(item) for item in locators],
                 fallback_pages=[self._to_page_context(item) for item in fallback],
                 freshness=FreshnessContext(
@@ -230,10 +241,71 @@ class ContextRetrievalService:
         return {
             "use_only_provided_locators": True,
             "verify_before_execute": True,
+            "prefer_navigation_plan": True,
             "allowed_element_types": ["action_btn", "form_input", "nav_link"],
             "min_stability_score": min_stability_score,
             "max_fallback_pages": 2,
         }
+
+    @staticmethod
+    def _build_navigation_plan(*, primary: ScoredCandidate, chain: list[MenuNodeRecord]) -> NavigationPlan:
+        candidate = primary.candidate
+        ordered_chain = sorted(chain, key=lambda item: item.depth_from_target, reverse=True)
+        if not ordered_chain:
+            ordered_chain = [
+                MenuNodeRecord(
+                    id=candidate.menu_id,
+                    parent_id=None,
+                    title=candidate.title,
+                    text_breadcrumb=candidate.text_breadcrumb,
+                    node_type=candidate.node_type,
+                    route_path=candidate.route_path,
+                    target_url=candidate.target_url,
+                    playwright_locator=None,
+                    depth_from_target=0,
+                )
+            ]
+
+        steps: list[NavigationStep] = []
+        seen_titles: set[str] = set()
+        click_sequence: list[str] = []
+        breadcrumb_chain: list[str] = []
+        for idx, node in enumerate(ordered_chain):
+            title = (node.title or "").strip()
+            if not title:
+                continue
+            steps.append(
+                NavigationStep(
+                    menu_id=str(node.id),
+                    title=title,
+                    level=idx,
+                    is_target=str(node.id) == str(candidate.menu_id),
+                    node_type=node.node_type,
+                    route_path=node.route_path,
+                    target_url=node.target_url,
+                    text_breadcrumb=node.text_breadcrumb,
+                    playwright_locator=node.playwright_locator,
+                )
+            )
+            lowered = title.lower()
+            if lowered not in seen_titles:
+                seen_titles.add(lowered)
+                click_sequence.append(title)
+                breadcrumb_chain.append(title)
+
+        if not steps:
+            click_sequence = [candidate.title]
+            breadcrumb_chain = [candidate.title]
+
+        return NavigationPlan(
+            target_menu_id=str(candidate.menu_id),
+            click_sequence=click_sequence,
+            breadcrumb_chain=breadcrumb_chain,
+            steps=steps,
+            route_path=candidate.route_path,
+            target_url=candidate.target_url,
+            route_fallback_enabled=True,
+        )
 
     @staticmethod
     def _build_trace(scored: list[ScoredCandidate]) -> list[TraceItem]:

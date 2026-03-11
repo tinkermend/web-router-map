@@ -83,6 +83,38 @@ def create_mcp_server() -> FastMCP:
         return result.model_dump(mode="json", exclude_none=True)
 
     @mcp.tool(
+        name="get_page_navigation_plan",
+        description=(
+            "Get deterministic menu navigation plan for a target page. "
+            "Returns ancestor click sequence + route fallback hints, based on nav_menus hierarchy."
+        ),
+    )
+    async def get_page_navigation_plan(
+        system_keyword: str,
+        page_keyword: str | None = None,
+        menu_keyword: str | None = None,
+        route_hint: str | None = None,
+        max_locators: int = 10,
+        max_fallback_pages: int = 2,
+        min_stability_score: float | None = None,
+        freshness_hours: int | None = None,
+        include_debug_trace: bool = False,
+    ) -> dict[str, Any]:
+        query = ContextQuery(
+            system_keyword=system_keyword,
+            page_keyword=page_keyword,
+            menu_keyword=menu_keyword,
+            route_hint=route_hint,
+            max_locators=max_locators,
+            max_fallback_pages=max_fallback_pages,
+            min_stability_score=min_stability_score,
+            freshness_hours=freshness_hours,
+            include_debug_trace=include_debug_trace,
+        )
+        result = await service.get_page_playwright_context(query)
+        return result.model_dump(mode="json", exclude_none=True)
+
+    @mcp.tool(
         name="get_storage_state_for_session",
         description=(
             "Get browser storage state (cookies, localStorage, sessionStorage) for Playwright session reuse. "

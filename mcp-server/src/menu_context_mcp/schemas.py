@@ -89,6 +89,19 @@ class LocatorRecord:
 
 
 @dataclass(slots=True)
+class MenuNodeRecord:
+    id: UUID
+    parent_id: UUID | None
+    title: str
+    text_breadcrumb: str | None
+    node_type: str | None
+    route_path: str | None
+    target_url: str | None
+    playwright_locator: str | None
+    depth_from_target: int
+
+
+@dataclass(slots=True)
 class ScoredCandidate:
     candidate: PageCandidate
     total_score: float
@@ -150,11 +163,35 @@ class TraceItem(BaseModel):
     filtered_reasons: list[str] = Field(default_factory=list)
 
 
+class NavigationStep(BaseModel):
+    menu_id: str
+    title: str
+    level: int
+    is_target: bool = False
+    node_type: str | None = None
+    route_path: str | None = None
+    target_url: str | None = None
+    text_breadcrumb: str | None = None
+    playwright_locator: str | None = None
+
+
+class NavigationPlan(BaseModel):
+    strategy: Literal["menu_chain_then_route_fallback"] = "menu_chain_then_route_fallback"
+    target_menu_id: str
+    click_sequence: list[str] = Field(default_factory=list)
+    breadcrumb_chain: list[str] = Field(default_factory=list)
+    steps: list[NavigationStep] = Field(default_factory=list)
+    route_path: str | None = None
+    target_url: str | None = None
+    route_fallback_enabled: bool = True
+
+
 class ContextResponse(BaseModel):
     status: Literal["ok", "system_not_found", "page_not_found", "need_recrawl"]
     stale_context: bool
     system: SystemContext | None = None
     target_page: PageContext | None = None
+    navigation_plan: NavigationPlan | None = None
     locators: list[LocatorContext] = Field(default_factory=list)
     fallback_pages: list[PageContext] = Field(default_factory=list)
     freshness: FreshnessContext | None = None

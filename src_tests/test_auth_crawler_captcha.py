@@ -78,6 +78,7 @@ def test_build_login_wait_payload_hash_router():
     assert payload["expected_origin"] == "https://demo.example.com"
     assert payload["login_path"] == ""
     assert payload["login_fragment"] == "auth/login"
+    assert payload["login_url_prefix_enabled"] is True
     assert "access_token" in payload["token_keys"]
     assert "sessionid" in payload["cookie_hints"]
 
@@ -87,6 +88,30 @@ def test_build_login_wait_payload_path_router():
     assert payload["expected_origin"] == "https://demo.example.com"
     assert payload["login_path"] == "/login"
     assert payload["login_fragment"] == ""
+    assert payload["login_path_is_login"] is True
+
+
+def test_build_login_wait_payload_hash_root_does_not_enable_login_prefix_match():
+    payload = ac._build_login_wait_payload("https://panjiachen.github.io/vue-element-admin/#/")
+    assert payload["login_path"] == "/vue-element-admin"
+    assert payload["login_fragment"] == ""
+    assert payload["login_path_is_login"] is False
+    assert payload["login_fragment_is_login"] is False
+    assert payload["login_url_prefix_enabled"] is False
+
+
+def test_build_login_wait_payload_does_not_match_login_substring_in_path():
+    payload = ac._build_login_wait_payload("https://demo.example.com/cataloging/#/")
+    assert payload["login_path"] == "/cataloging"
+    assert payload["login_path_is_login"] is False
+    assert payload["login_url_prefix_enabled"] is False
+
+
+def test_build_login_wait_payload_does_not_use_login_subdomain_as_login_marker():
+    payload = ac._build_login_wait_payload("https://login.example.com/#/")
+    assert payload["login_path"] == ""
+    assert payload["login_fragment"] == ""
+    assert payload["login_url_prefix_enabled"] is False
 
 
 @pytest.mark.asyncio
@@ -98,6 +123,8 @@ async def test_wait_login_success_uses_wait_for_function():
     script, payload, timeout = page.calls[0]
     assert timeout == 12_000
     assert payload["login_fragment"] == "auth/login"
+    assert payload["login_url_prefix_enabled"] is True
+    assert "loginUrlPrefixEnabled && loginUrl && href.startsWith(loginUrl)" in script
     assert "return awayFromLogin;" in script
     assert "hasCookieSignal" not in script
 

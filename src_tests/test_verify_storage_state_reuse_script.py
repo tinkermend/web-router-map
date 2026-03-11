@@ -194,3 +194,33 @@ def test_generate_script_parse_args_uses_fast_defaults():
     assert args.timeout_ms == 8000
     assert args.slow_mo == 50
     assert args.headless is False
+
+
+@pytest.mark.parametrize(
+    "raw_page,expected",
+    [
+        ("看一下图形验证码系统下面的超级管理员下的菜单管理页面数据表格是否正常展现", "菜单管理"),
+        ("超级管理员 菜单管理", "菜单管理"),
+        ("菜单管理", "菜单管理"),
+    ],
+)
+def test_generate_script_extract_page_keyword(raw_page: str, expected: str):
+    assert generate_script.extract_page_keyword("图形验证码系统", raw_page) == expected
+
+
+def test_generate_script_route_only_context_keeps_navigation_path():
+    context = {
+        "system": {"name": "Demo", "base_url": "https://demo.example.com"},
+        "target_page": {"title": "菜单管理", "target_url": None, "route_path": "/admin/menu"},
+        "navigation_plan": {
+            "route_path": "/admin/menu",
+            "route_fallback_enabled": True,
+            "steps": [],
+        },
+        "locators": [],
+    }
+    storage_state = {"state": {"storage_state": {}}}
+    script = generate_script.generate_script(context, storage_state)
+    assert "missing_target_or_route" in script
+    assert "missing_target_or_base_url" not in script
+    assert "_url_hits_target(current_url, target_url, route_path)" in script

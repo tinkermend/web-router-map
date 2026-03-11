@@ -10,7 +10,7 @@ from typing import Sequence
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from menu_context_mcp.schemas import ContextQuery, LocatorRecord, PageCandidate, StageName, SystemRecord
+from menu_context_mcp.schemas import ContextQuery, LocatorRecord, MenuNodeRecord, PageCandidate, StageName, SystemRecord
 
 
 @dataclass(slots=True)
@@ -325,6 +325,76 @@ class ContextRepository:
             if len(locators) >= limit:
                 break
         return locators
+
+    async def fetch_navigation_chain(
+        self,
+        session: AsyncSession,
+        *,
+        system_id: str,
+        menu_id: str,
+    ) -> list[MenuNodeRecord]:
+        """Fetch menu chain from root to target menu for deterministic navigation."""
+        sql = text(
+            """
+            WITH RECURSIVE menu_chain AS (
+                SELECT
+                    m.id,
+                    m.parent_id,
+                    m.title,
+                    m.text_breadcrumb,
+                    m.node_type,
+                    m.route_path,
+                    m.target_url,
+                    m.playwright_locator,
+                    0::int AS depth_from_target
+                FROM nav_menus AS m
+                WHERE m.system_id = :system_id
+                  AND m.id = CAST(:menu_id AS uuid)
+                UNION ALL
+                SELECT
+                    p.id,
+                    p.parent_id,
+                    p.title,
+                    p.text_breadcrumb,
+                    p.node_type,
+                    p.route_path,
+                    p.target_url,
+                    p.playwright_locator,
+                    c.depth_from_target + 1
+                FROM nav_menus AS p
+                JOIN menu_chain AS c
+                  ON c.parent_id = p.id
+                WHERE p.system_id = :system_id
+            )
+            SELECT
+                id,
+                parent_id,
+                title,
+                text_breadcrumb,
+                node_type,
+                route_path,
+                target_url,
+                playwright_locator,
+                depth_from_target
+            FROM menu_chain
+            ORDER BY depth_from_target DESC, title ASC
+            """
+        )
+        rows = (await session.execute(sql, {"system_id": system_id, "menu_id": menu_id})).mappings().all()
+        return [
+            MenuNodeRecord(
+                id=row["id"],
+                parent_id=row["parent_id"],
+                title=row["title"] or "",
+                text_breadcrumb=row["text_breadcrumb"],
+                node_type=row["node_type"],
+                route_path=row["route_path"],
+                target_url=row["target_url"],
+                playwright_locator=row["playwright_locator"],
+                depth_from_target=int(row["depth_from_target"] or 0),
+            )
+            for row in rows
+        ]
 
     @staticmethod
     def _map_candidate(row: dict, stage: StageName) -> PageCandidate:

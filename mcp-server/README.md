@@ -148,6 +148,33 @@ MCP_TRANSPORT=streamable-http MCP_HOST=0.0.0.0 MCP_PORT=8765 menu-context-mcp
     "score": 0.92,
     "recall_stage": "exact"
   },
+  "navigation_plan": {
+    "strategy": "menu_chain_then_route_fallback",
+    "target_menu_id": "uuid-xxx",
+    "click_sequence": ["系统设置", "权限管理", "用户管理"],
+    "breadcrumb_chain": ["系统设置", "权限管理", "用户管理"],
+    "steps": [
+      {
+        "menu_id": "uuid-root",
+        "title": "系统设置",
+        "level": 0,
+        "is_target": false,
+        "playwright_locator": "get_by_text('系统设置')"
+      },
+      {
+        "menu_id": "uuid-xxx",
+        "title": "用户管理",
+        "level": 2,
+        "is_target": true,
+        "route_path": "/admin/users",
+        "target_url": "https://erp.example.com/admin/users",
+        "playwright_locator": "get_by_text('用户管理')"
+      }
+    ],
+    "route_path": "/admin/users",
+    "target_url": "https://erp.example.com/admin/users",
+    "route_fallback_enabled": true
+  },
   "locators": [
     {
       "element_type": "action_btn",
@@ -175,8 +202,9 @@ MCP_TRANSPORT=streamable-http MCP_HOST=0.0.0.0 MCP_PORT=8765 menu-context-mcp
     "freshness_hours": 168
   },
   "constraints": {
-    "only_use_provided_locators": true,
-    "verify_url_after_navigation": true
+    "use_only_provided_locators": true,
+    "verify_before_execute": true,
+    "prefer_navigation_plan": true
   },
   "reasons": []
 }
@@ -213,7 +241,30 @@ MCP_TRANSPORT=streamable-http MCP_HOST=0.0.0.0 MCP_PORT=8765 menu-context-mcp
 
 ---
 
-### 3. `get_storage_state_for_session`（会话复用）
+### 3. `get_page_navigation_plan`（导航链路专用）
+
+获取页面的父子菜单导航计划，返回 `navigation_plan`（父级点击顺序、逐级 locator、route fallback）。
+
+#### 入参
+
+| 参数                  | 类型   | 必填   | 默认值 | 说明                                    |
+| --------------------- | ------ | ------ | ------ | --------------------------------------- |
+| `system_keyword`      | string | **是** | -      | 系统关键词                               |
+| `page_keyword`        | string | 否     | -      | 页面关键词                               |
+| `menu_keyword`        | string | 否     | -      | 菜单关键词（与 page_keyword 二选一）     |
+| `route_hint`          | string | 否     | -      | 路由提示                                 |
+| `max_fallback_pages`  | int    | 否     | 2      | 备选页面数量（0-2）                      |
+| `min_stability_score` | float  | 否     | 0.7    | 定位器最低稳定度阈值（0-1）              |
+| `freshness_hours`     | int    | 否     | 168    | 数据新鲜度阈值（小时）                   |
+| `include_debug_trace` | bool   | 否     | false  | 是否返回调试追踪信息                     |
+
+#### 出参
+
+与 `get_page_playwright_context` 相同，但推荐优先消费 `navigation_plan` 用于菜单点击链路执行。
+
+---
+
+### 4. `get_storage_state_for_session`（会话复用）
 
 获取浏览器存储状态（cookies、localStorage、sessionStorage），用于 Playwright 脚本跳过登录，直接复用已有会话。
 
