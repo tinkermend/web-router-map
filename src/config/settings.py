@@ -6,6 +6,8 @@ from functools import lru_cache
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
 class Settings(BaseSettings):
     """Global application settings sourced from environment variables."""
 
@@ -31,6 +33,13 @@ class Settings(BaseSettings):
     api_host: str = Field(default="0.0.0.0", validation_alias="API_HOST")
     api_port: int = Field(default=8000, validation_alias="API_PORT")
     api_workers: int = Field(default=4, validation_alias="API_WORKERS")
+
+    # Logging
+    log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
+    log_file: str = Field(default="logs/app.log", validation_alias="LOG_FILE")
+    log_rotation: str = Field(default="100 MB", validation_alias="LOG_ROTATION")
+    log_retention: str = Field(default="30 days", validation_alias="LOG_RETENTION")
+    log_json: bool = Field(default=False, validation_alias="LOG_JSON")
 
     # Redis / Lock
     redis_url: str = Field(default="redis://127.0.0.1:6379/0", validation_alias="REDIS_URL")

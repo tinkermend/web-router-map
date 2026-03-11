@@ -5,6 +5,9 @@ from __future__ import annotations
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from src.config.settings import get_settings
+from src.infrastructure.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class SchedulerManager:
@@ -22,14 +25,17 @@ class SchedulerManager:
     def start(self) -> None:
         settings = get_settings()
         if not settings.scheduler_enabled:
+            logger.info("Scheduler disabled by configuration")
             return
         scheduler = self.scheduler
         if not scheduler.running:
             scheduler.start()
+            logger.info("Scheduler started")
 
     def shutdown(self) -> None:
         if self._scheduler and self._scheduler.running:
             self._scheduler.shutdown(wait=False)
+            logger.info("Scheduler stopped")
 
 
 scheduler_manager = SchedulerManager()

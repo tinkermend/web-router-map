@@ -95,6 +95,13 @@ async def test_login_auth_fail_fast_for_unimplemented_types():
         await ac._solve_login_challenge(None, "sso", {}, 1000)
 
 
+def test_require_ddddocr_error_includes_actionable_hint(monkeypatch):
+    monkeypatch.setattr(ac, "ddddocr", None)
+    monkeypatch.setattr(ac, "_DDDDOCR_IMPORT_ERROR", "ImportError('cannot import name DdddOcr')")
+    with pytest.raises(RuntimeError, match="pip install 'ddddocr>=1.4,<1.5'"):
+        ac._require_ddddocr("captcha_slider")
+
+
 @pytest.mark.asyncio
 async def test_image_captcha_retry_then_fill(monkeypatch):
     page = DummyPage(

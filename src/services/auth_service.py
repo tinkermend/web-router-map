@@ -15,6 +15,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from src.config.settings import get_settings
 from src.crawler.auth_crawler import AuthCapture, AuthCrawler, TOKEN_KEYS
+from src.infrastructure.logging import get_logger
 from src.models.storage_state import StorageState
 from src.models.web_system import WebSystem
 from src.scheduler.locks import distributed_lock
@@ -23,6 +24,7 @@ from src.services.task_tracker import TaskTracker
 from src.services.validator_service import ValidationResult, validate_capture
 
 AUTH_COOKIE_KEYS = {"session", "sessionid", "jsessionid", "token", "auth", "access_token"}
+service_logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -75,9 +77,12 @@ class AuthService:
     ) -> AuthRefreshResult:
         started_at = _utc_now()
         task_log_id: UUID | None = None
+        auth_logger = service_logger.bind(sys_code=sys_code, task_type="auth", headed=headed)
+        auth_logger.info("Auth refresh started")
         system = await self._get_active_system(sys_code)
         if system is None:
             finished_at = _utc_now()
+            auth_logger.warning("Auth refresh aborted: system not found or inactive")
             return AuthRefreshResult(
                 sys_code=sys_code,
                 status="failed",
@@ -99,11 +104,14 @@ class AuthService:
             target_url=system.login_url or system.base_url,
         )
         task_log_id = task_log.id
+        auth_logger = auth_logger.bind(log_id=str(task_log_id))
+        auth_logger.info("Auth task log created")
 
         username = self._resolve_secret(system.login_username)
         password = self._resolve_secret(system.login_password)
         if not username or not password:
             finished_at = _utc_now()
+            auth_logger.error("Auth refresh failed: missing credentials")
             await self.task_tracker.finish(
                 log_id=task_log_id,
                 status="failed",
@@ -131,6 +139,7 @@ class AuthService:
         async with distributed_lock.acquire(lock_name) as acquired:
             if not acquired:
                 finished_at = _utc_now()
+                auth_logger.warning("Auth refresh skipped: lock is already held")
                 await self.task_tracker.finish(
                     log_id=task_log_id,
                     status="skipped",
@@ -155,6 +164,10 @@ class AuthService:
             last_error: str | None = None
             for attempt in range(1, self.settings.auth_max_retries + 1):
                 try:
+                    auth_logger.bind(
+                        attempt=attempt,
+                        max_retries=self.settings.auth_max_retries,
+                    ).info("Auth refresh attempt started")
                     capture = await self.crawler.login_and_capture(
                         login_url=system.login_url or system.base_url,
                         username=username,
@@ -185,6 +198,13 @@ class AuthService:
                         status="success",
                         retry_count=max(0, attempt - 1),
                     )
+                    auth_logger.bind(
+                        attempt=attempt,
+                        state_id=str(state_id),
+                        cookies_count=len(capture.cookies),
+                        local_storage_count=len(capture.local_storage),
+                        session_storage_count=len(capture.session_storage),
+                    ).info("Auth refresh succeeded")
                     return AuthRefreshResult(
                         sys_code=sys_code,
                         status="success",
@@ -201,11 +221,16 @@ class AuthService:
                     )
                 except Exception as exc:  # pragma: no cover - runtime flow
                     last_error = str(exc)
+                    auth_logger.bind(
+                        attempt=attempt,
+                        max_retries=self.settings.auth_max_retries,
+                    ).exception("Auth refresh attempt failed")
                     await self._mark_auth_failure(system.id, last_error)
                     if attempt < self.settings.auth_max_retries:
                         await asyncio.sleep(self.settings.auth_retry_delay_seconds)
 
             finished_at = _utc_now()
+            auth_logger.bind(last_error=last_error or "").error("Auth refresh exhausted all retries")
             await self.task_tracker.finish(
                 log_id=task_log_id,
                 status="failed",
@@ -234,8 +259,10 @@ class AuthService:
     ) -> UUID | None:
         """Persist manually provided auth payload as latest valid state."""
 
+        manual_logger = service_logger.bind(sys_code=sys_code, task_type="auth")
         system = await self._get_active_system(sys_code)
         if system is None:
+            manual_logger.warning("Manual state injection skipped: system not found or inactive")
             return None
 
         capture = AuthCapture(
@@ -270,6 +297,7 @@ class AuthService:
             analysis,
             ValidationResult(is_valid=None, status_code=None, response_ms=None, error=None),
         )
+        manual_logger.bind(state_id=str(state_id)).info("Manual state injection succeeded")
         return state_id
 
     async def get_latest_state(self, sys_code: str) -> tuple[WebSystem | None, StorageState | None]:
@@ -299,6 +327,7 @@ class AuthService:
 
     async def _mark_auth_failure(self, system_id: UUID, error: str) -> None:
         now = _utc_now()
+        service_logger.bind(system_id=str(system_id), error=error).warning("Marking auth failure on system")
         stmt = (
             update(WebSystem)
             .where(WebSystem.id == system_id)

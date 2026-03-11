@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -44,6 +45,37 @@ def setup_logging(
             encoding="utf-8",
             serialize=json_format,
         )
+
+
+class _InterceptHandler(logging.Handler):
+    """Forward stdlib logging records to Loguru."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+
+        frame = logging.currentframe()
+        depth = 2
+        while frame and frame.f_code.co_filename == logging.__file__:
+            frame = frame.f_back
+            depth += 1
+
+        logger.bind(logger_name=record.name).opt(
+            depth=depth,
+            exception=record.exc_info,
+        ).log(level, record.getMessage())
+
+
+def setup_uvicorn_logging() -> None:
+    """Redirect uvicorn access/error loggers to Loguru sinks."""
+
+    intercept = _InterceptHandler()
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        target_logger = logging.getLogger(logger_name)
+        target_logger.handlers = [intercept]
+        target_logger.propagate = False
 
 
 def get_logger(name: str):

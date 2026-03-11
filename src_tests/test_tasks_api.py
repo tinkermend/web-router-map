@@ -6,22 +6,29 @@ from uuid import uuid4
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 
 from src.api.router import api_router
 from src.config.settings import get_settings
 from src.models.crawl_log import CrawlLog
-from src.models.database import close_db, init_db, ping_db, session_scope
+from src.models.database import close_db, get_session_factory, init_db, ping_db, session_scope
 from src.models.web_system import WebSystem
 
 
 @pytest.fixture(autouse=True)
 async def _prepare_env(monkeypatch):
+    test_schema = f"ut_api_{uuid4().hex[:10]}"
+    monkeypatch.setenv("DATABASE_SCHEMA", test_schema)
     monkeypatch.setenv("ENCRYPTION_KEY", "test-tasks-api-key")
     get_settings.cache_clear()
     if not await ping_db():
         pytest.skip("PostgreSQL is not reachable in current environment.")
     await init_db()
     yield
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        await session.exec(text(f'DROP SCHEMA IF EXISTS "{test_schema}" CASCADE'))
+        await session.commit()
     await close_db()
     get_settings.cache_clear()
 

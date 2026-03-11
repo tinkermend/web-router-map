@@ -15,8 +15,11 @@ from playwright.async_api import async_playwright
 
 try:
     import ddddocr
-except Exception:  # pragma: no cover - optional dependency
+except Exception as exc:  # pragma: no cover - optional dependency
     ddddocr = None
+    _DDDDOCR_IMPORT_ERROR = repr(exc)
+else:
+    _DDDDOCR_IMPORT_ERROR = None
 
 try:  # pragma: no cover - optional dependency
     from PIL import Image
@@ -254,7 +257,11 @@ async def _solve_login_challenge(
 
 def _require_ddddocr(login_auth: str):
     if ddddocr is None:
-        raise RuntimeError(f"ddddocr is required for login_auth {login_auth}")
+        detail = f" (import_error={_DDDDOCR_IMPORT_ERROR})" if _DDDDOCR_IMPORT_ERROR else ""
+        raise RuntimeError(
+            f"ddddocr is required for login_auth {login_auth}{detail}. "
+            "Install a stable version, e.g. `pip install 'ddddocr>=1.4,<1.5'`."
+        )
     return ddddocr
 
 

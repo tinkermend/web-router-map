@@ -24,6 +24,11 @@ def _clear_database_env(monkeypatch) -> None:
         "DEFAULT_AUTH_CRON",
         "ENCRYPTION_KEY",
         "DEBUG",
+        "LOG_LEVEL",
+        "LOG_FILE",
+        "LOG_ROTATION",
+        "LOG_RETENTION",
+        "LOG_JSON",
     ]:
         monkeypatch.delenv(key, raising=False)
 
@@ -42,6 +47,11 @@ def test_settings_defaults(monkeypatch) -> None:
     monkeypatch.setenv("DEFAULT_AUTH_CRON", "0 */6 * * *")
     monkeypatch.setenv("ENCRYPTION_KEY", "test-default-encryption-key")
     monkeypatch.setenv("DEBUG", "false")
+    monkeypatch.setenv("LOG_LEVEL", "INFO")
+    monkeypatch.setenv("LOG_FILE", "logs/app.log")
+    monkeypatch.setenv("LOG_ROTATION", "100 MB")
+    monkeypatch.setenv("LOG_RETENTION", "30 days")
+    monkeypatch.setenv("LOG_JSON", "false")
     get_settings.cache_clear()
 
     settings = get_settings()
@@ -63,6 +73,11 @@ def test_settings_defaults(monkeypatch) -> None:
     assert settings.default_auth_cron == "0 */6 * * *"
     assert settings.encryption_key == "test-default-encryption-key"
     assert settings.debug is False
+    assert settings.log_level == "INFO"
+    assert settings.log_file == "logs/app.log"
+    assert settings.log_rotation == "100 MB"
+    assert settings.log_retention == "30 days"
+    assert settings.log_json is False
 
 
 def test_settings_env_override(monkeypatch) -> None:
@@ -85,6 +100,11 @@ def test_settings_env_override(monkeypatch) -> None:
     monkeypatch.setenv("DEFAULT_AUTH_CRON", "*/10 * * * *")
     monkeypatch.setenv("ENCRYPTION_KEY", "secret-key")
     monkeypatch.setenv("DEBUG", "true")
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("LOG_FILE", "logs/test.log")
+    monkeypatch.setenv("LOG_ROTATION", "10 MB")
+    monkeypatch.setenv("LOG_RETENTION", "3 days")
+    monkeypatch.setenv("LOG_JSON", "true")
     get_settings.cache_clear()
 
     settings = get_settings()
@@ -106,6 +126,11 @@ def test_settings_env_override(monkeypatch) -> None:
     assert settings.default_auth_cron == "*/10 * * * *"
     assert settings.encryption_key == "secret-key"
     assert settings.debug is True
+    assert settings.log_level == "DEBUG"
+    assert settings.log_file == "logs/test.log"
+    assert settings.log_rotation == "10 MB"
+    assert settings.log_retention == "3 days"
+    assert settings.log_json is True
 
 
 def test_settings_requires_encryption_key(monkeypatch) -> None:

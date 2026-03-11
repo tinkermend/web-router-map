@@ -7,12 +7,13 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import text
 from sqlmodel import select
 
 from src.config.settings import get_settings
 from src.crawler.auth_crawler import AuthCapture
 from src.models.crawl_log import CrawlLog
-from src.models.database import close_db, init_db, ping_db, session_scope
+from src.models.database import close_db, get_session_factory, init_db, ping_db, session_scope
 from src.models.storage_state import StorageState
 from src.models.web_system import WebSystem
 from src.scheduler.locks import distributed_lock
@@ -23,6 +24,8 @@ from src.services.validator_service import ValidationResult
 
 @pytest.fixture(autouse=True)
 async def _prepare_env(monkeypatch):
+    test_schema = f"ut_task_{uuid4().hex[:10]}"
+    monkeypatch.setenv("DATABASE_SCHEMA", test_schema)
     monkeypatch.setenv("ENCRYPTION_KEY", "test-task-tracker-key")
     monkeypatch.setenv("AUTH_MAX_RETRIES", "1")
     get_settings.cache_clear()
@@ -30,6 +33,10 @@ async def _prepare_env(monkeypatch):
         pytest.skip("PostgreSQL is not reachable in current environment.")
     await init_db()
     yield
+    session_factory = get_session_factory()
+    async with session_factory() as session:
+        await session.exec(text(f'DROP SCHEMA IF EXISTS "{test_schema}" CASCADE'))
+        await session.commit()
     await close_db()
     get_settings.cache_clear()
 
