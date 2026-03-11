@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import io
 import random
+import re
 from dataclasses import dataclass
+from typing import Any, Sequence
 from urllib.parse import urlsplit
 
 from playwright.async_api import Page
@@ -14,6 +17,11 @@ try:
     import ddddocr
 except Exception:  # pragma: no cover - optional dependency
     ddddocr = None
+
+try:  # pragma: no cover - optional dependency
+    from PIL import Image
+except Exception:  # pragma: no cover - optional dependency
+    Image = None
 
 AUTH_HEADER_KEYS = {
     "authorization",
@@ -32,6 +40,39 @@ TOKEN_KEYS = (
     "auth_token",
     "authorization",
     "skillsflow:access_token",
+)
+
+SUPPORTED_LOGIN_AUTH_TYPES = {
+    "captcha_slider",
+    "captcha_image",
+    "captcha_click",
+    "captcha_sms",
+    "sso",
+    "none",
+}
+
+UNIMPLEMENTED_LOGIN_AUTH_TYPES = {"captcha_sms", "sso"}
+CLICK_TOKEN_RE = re.compile(r"[\u4e00-\u9fffA-Za-z0-9]")
+CLICK_SPLIT_RE = re.compile(r"[\s,，、;；|]+")
+SLIDER_SUCCESS_TEXT_RE = re.compile(r"(验证通过|verification\s*passed|captcha\s*passed|success)", re.IGNORECASE)
+CLICK_PROMPT_PREFIXES = tuple(
+    sorted(
+        {
+            "请按顺序点击",
+            "按顺序点击",
+            "请依次点击",
+            "依次点击",
+            "请点击",
+            "请按",
+            "请在",
+            "请依次",
+            "点击",
+            "依次",
+            "请",
+        },
+        key=len,
+        reverse=True,
+    )
 )
 
 
@@ -100,8 +141,7 @@ class AuthCrawler:
             try:
                 await page.goto(login_url, wait_until="domcontentloaded", timeout=timeout_ms)
                 await _fill_username_password(page, login_selectors, username, password)
-                if login_auth in {"captcha_slider", "captcha_click"}:
-                    await _solve_slider_captcha(page, timeout_ms)
+                await _solve_login_challenge(page, login_auth, login_selectors, timeout_ms)
                 await _click_submit(page, login_selectors)
                 await _wait_login_success(page, timeout_ms)
                 await page.wait_for_timeout(1500)
@@ -183,19 +223,97 @@ async def _wait_login_success(page: Page, timeout_ms: int) -> None:
         raise RuntimeError("Login did not redirect away from login page.") from exc
 
 
+async def _solve_login_challenge(
+    page: Page,
+    login_auth: str,
+    selectors: dict,
+    timeout_ms: int,
+) -> None:
+    auth_type = str(login_auth or "none").strip().lower()
+    if not auth_type or auth_type == "none":
+        return
+
+    if auth_type not in SUPPORTED_LOGIN_AUTH_TYPES:
+        raise RuntimeError(f"Unsupported login_auth type: {auth_type}")
+
+    if auth_type in UNIMPLEMENTED_LOGIN_AUTH_TYPES:
+        raise RuntimeError(f"login_auth {auth_type} is not implemented yet")
+
+    if auth_type == "captcha_slider":
+        await _solve_slider_captcha(page, timeout_ms, selectors)
+        return
+    if auth_type == "captcha_image":
+        await _solve_image_captcha(page, timeout_ms, selectors)
+        return
+    if auth_type == "captcha_click":
+        await _solve_click_captcha(page, timeout_ms, selectors)
+        return
+
+    raise RuntimeError(f"Unsupported login_auth type: {auth_type}")
+
+
+def _require_ddddocr(login_auth: str):
+    if ddddocr is None:
+        raise RuntimeError(f"ddddocr is required for login_auth {login_auth}")
+    return ddddocr
+
+
+def _new_slider_ocr():
+    return _require_ddddocr("captcha_slider").DdddOcr(det=False, ocr=False, show_ad=False)
+
+
+def _new_text_ocr(login_auth: str = "captcha_image"):
+    return _require_ddddocr(login_auth).DdddOcr(det=False, ocr=True, show_ad=False)
+
+
+def _new_detection_ocr():
+    return _require_ddddocr("captcha_click").DdddOcr(det=True, ocr=False, show_ad=False)
+
+
+def _captcha_scope(selectors: dict, captcha_type: str) -> dict[str, Any]:
+    if not isinstance(selectors, dict):
+        return {}
+    captcha_obj = selectors.get("captcha")
+    if not isinstance(captcha_obj, dict):
+        return {}
+    scoped = captcha_obj.get(captcha_type)
+    return scoped if isinstance(scoped, dict) else {}
+
+
+def _first_non_empty(values: Sequence[Any], default: str = "") -> str:
+    for value in values:
+        candidate = str(value or "").strip()
+        if candidate:
+            return candidate
+    return default
+
+
+def _resolve_captcha_selector(
+    selectors: dict,
+    captcha_type: str,
+    key: str,
+    *,
+    legacy_keys: Sequence[str] = (),
+    default: str = "",
+) -> str:
+    scope = _captcha_scope(selectors, captcha_type)
+    choices = [scope.get(key)]
+    choices.extend(selectors.get(legacy_key) for legacy_key in legacy_keys)
+    return _first_non_empty(choices, default=default)
+
+
 def _estimate_drag_distance(
     slider_track_png: bytes,
     slider_handle_png: bytes,
     track_width: float,
     handle_width: float,
+    *,
+    slide_ocr: Any,
 ) -> float:
     max_distance = max(0.0, track_width - handle_width - 2.0)
-    if ddddocr is None:
-        return max_distance
 
     try:
-        ocr = ddddocr.DdddOcr(det=False, ocr=False, show_ad=False)
-        result = ocr.slide_match(slider_handle_png, slider_track_png, simple_target=True)
+        result = slide_ocr.slide_match(slider_handle_png, slider_track_png, simple_target=True)
         target_x = 0
         if isinstance(result, dict):
             target_x = int(result.get("target_x") or 0)
@@ -209,8 +327,8 @@ def _estimate_drag_distance(
     return max_distance
 
 
-async def _drag_slider(page: Page, drag_distance: float) -> None:
-    slider_handle = page.locator('[name="captcha-action"]').first
+async def _drag_slider(page: Page, drag_distance: float, *, handle_selector: str) -> None:
+    slider_handle = page.locator(handle_selector).first
     handle_box = await slider_handle.bounding_box()
     if not handle_box:
         raise RuntimeError("Cannot find slider handle bounding box.")
@@ -236,13 +354,40 @@ async def _drag_slider(page: Page, drag_distance: float) -> None:
     await page.mouse.up()
 
 
-async def _solve_slider_captcha(page: Page, timeout_ms: int) -> None:
-    slider_hint = page.locator("#v-7-form-item div").nth(1)
-    slider_track = page.locator("#v-7-form-item")
-    slider_handle = page.locator('[name="captcha-action"]').first
+async def _solve_slider_captcha(page: Page, timeout_ms: int, selectors: dict) -> None:
+    track_selector = _resolve_captcha_selector(
+        selectors,
+        "slider",
+        "track",
+        legacy_keys=("captcha_slider_track",),
+        default="#v-7-form-item",
+    )
+    handle_selector = _resolve_captcha_selector(
+        selectors,
+        "slider",
+        "handle",
+        legacy_keys=("captcha_slider_handle",),
+        default='[name="captcha-action"]',
+    )
+    hint_selector = _resolve_captcha_selector(
+        selectors,
+        "slider",
+        "hint",
+        legacy_keys=("captcha_slider_hint",),
+        default="",
+    )
+    slider_track = page.locator(track_selector).first
+    slider_handle = page.locator(handle_selector).first
+    slide_ocr = _new_slider_ocr()
 
-    await slider_hint.wait_for(state="visible", timeout=timeout_ms)
+    await slider_track.wait_for(state="visible", timeout=timeout_ms)
     await slider_handle.wait_for(state="visible", timeout=timeout_ms)
+    slider_hint = await _resolve_slider_hint_locator(
+        page,
+        slider_track,
+        timeout_ms=timeout_ms,
+        hint_selector=hint_selector,
+    )
 
     for _attempt in range(1, 4):
         track_box = await slider_track.bounding_box()
@@ -257,15 +402,347 @@ async def _solve_slider_captcha(page: Page, timeout_ms: int) -> None:
             slider_handle_png=handle_png,
             track_width=track_box["width"],
             handle_width=handle_box["width"],
+            slide_ocr=slide_ocr,
         )
-        await _drag_slider(page, drag_distance)
+        await _drag_slider(page, drag_distance, handle_selector=handle_selector)
         await page.wait_for_timeout(800)
 
-        slider_text = (await slider_hint.inner_text()).strip()
-        if "验证通过" in slider_text:
+        if await _is_slider_verified(slider_hint, slider_track):
             return
 
     raise RuntimeError("Slider captcha verification failed after 3 attempts.")
+
+
+async def _resolve_slider_hint_locator(
+    page: Page,
+    slider_track: Any,
+    *,
+    timeout_ms: int,
+    hint_selector: str,
+):
+    if hint_selector:
+        locator = page.locator(hint_selector).first
+        await locator.wait_for(state="visible", timeout=timeout_ms)
+        return locator
+
+    probe_timeout = max(300, min(timeout_ms, 1200))
+    candidates = (
+        slider_track.locator("div").nth(1),
+        slider_track.locator("div").first,
+        page.locator("text=/验证通过|拖动滑块|滑块验证|按住滑块|请完成滑块验证/i").first,
+    )
+    for candidate in candidates:
+        try:
+            await candidate.wait_for(state="visible", timeout=probe_timeout)
+            return candidate
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        "Cannot auto-detect slider hint element. Configure login_selectors.captcha.slider.hint in web_systems.login_selectors."
+    )
+
+
+def _is_slider_success_text(text: str) -> bool:
+    return bool(SLIDER_SUCCESS_TEXT_RE.search(str(text or "").strip()))
+
+
+async def _is_slider_verified(slider_hint: Any, slider_track: Any) -> bool:
+    try:
+        if _is_slider_success_text(await slider_hint.inner_text()):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if _is_slider_success_text(await slider_track.inner_text()):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _classify_image_captcha_code(img_bytes: bytes) -> str:
+    text_ocr = _new_text_ocr("captcha_image")
+    try:
+        raw = str(text_ocr.classification(img_bytes) or "")
+    except Exception:
+        return ""
+    clean = "".join(ch for ch in raw if ch.isalnum())
+    if 3 <= len(clean) <= 8:
+        return clean
+    return ""
+
+
+async def _solve_image_captcha(page: Page, timeout_ms: int, selectors: dict) -> None:
+    image_selector = _resolve_captcha_selector(
+        selectors,
+        "image",
+        "image",
+        legacy_keys=("captcha_image", "captcha_image_selector"),
+    )
+    input_selector = _resolve_captcha_selector(
+        selectors,
+        "image",
+        "input",
+        legacy_keys=("captcha_input", "captcha_input_selector"),
+    )
+    refresh_selector = _resolve_captcha_selector(
+        selectors,
+        "image",
+        "refresh",
+        legacy_keys=("captcha_refresh", "captcha_refresh_selector"),
+    )
+    if not image_selector or not input_selector:
+        raise RuntimeError("captcha_image requires selectors: captcha.image.image and captcha.image.input")
+
+    image_locator = page.locator(image_selector).first
+    input_locator = page.locator(input_selector).first
+    refresh_locator = page.locator(refresh_selector).first if refresh_selector else None
+
+    await image_locator.wait_for(state="visible", timeout=timeout_ms)
+    await input_locator.wait_for(state="visible", timeout=timeout_ms)
+
+    for _attempt in range(1, 4):
+        image_png = await image_locator.screenshot()
+        captcha_value = _classify_image_captcha_code(image_png)
+        if captcha_value:
+            await input_locator.fill(captcha_value)
+            return
+
+        if refresh_locator is not None:
+            await refresh_locator.click()
+            await page.wait_for_timeout(500)
+
+    raise RuntimeError("Image captcha recognition failed after 3 attempts.")
+
+
+def _split_click_tokens(text: str) -> list[str]:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return []
+    pieces = [piece.strip() for piece in CLICK_SPLIT_RE.split(normalized) if piece.strip()]
+    if len(pieces) > 1:
+        return [piece for piece in pieces if CLICK_TOKEN_RE.search(piece)]
+    one = pieces[0] if pieces else normalized
+    if re.fullmatch(r"[\u4e00-\u9fff]+", one) and len(one) > 1:
+        return list(one)
+    if re.fullmatch(r"[A-Za-z0-9]+", one) and len(one) > 1:
+        return list(one)
+    return [one] if CLICK_TOKEN_RE.search(one) else []
+
+
+def _extract_click_targets(prompt_text: str) -> list[str]:
+    text = str(prompt_text or "").strip()
+    if not text:
+        return []
+
+    quoted_segments = re.findall(r"[\"“](.*?)[\"”]", text)
+    if quoted_segments:
+        targets: list[str] = []
+        for segment in quoted_segments:
+            targets.extend(_split_click_tokens(segment))
+        if targets:
+            return targets
+
+    if "：" in text:
+        text = text.split("：", maxsplit=1)[1]
+    elif ":" in text:
+        text = text.split(":", maxsplit=1)[1]
+
+    text = _strip_click_prompt_prefix(text)
+    parsed = _split_click_tokens(text)
+    if parsed:
+        return parsed
+
+    return CLICK_TOKEN_RE.findall(text)
+
+
+def _strip_click_prompt_prefix(text: str) -> str:
+    cleaned = str(text or "").strip()
+    while cleaned:
+        for prefix in CLICK_PROMPT_PREFIXES:
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix) :].strip()
+                break
+        else:
+            break
+    return cleaned
+
+
+def _normalize_click_token(token: str) -> str:
+    match = CLICK_TOKEN_RE.findall(str(token or ""))
+    return match[0] if match else ""
+
+
+def _crop_png(image: Any, bbox: tuple[int, int, int, int]) -> bytes:
+    x1, y1, x2, y2 = bbox
+    cropped = image.crop((x1, y1, x2, y2))
+    buffer = io.BytesIO()
+    cropped.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _detect_click_target_points(
+    image_png: bytes,
+    targets: list[str],
+    detect_ocr: Any,
+    text_ocr: Any,
+    image_box: dict[str, float],
+) -> list[tuple[float, float]] | None:
+    if Image is None:
+        raise RuntimeError("Pillow is required for captcha_click image crop.")
+
+    try:
+        boxes = detect_ocr.detection(img_bytes=image_png)
+    except Exception:
+        return None
+    if not isinstance(boxes, list) or not boxes:
+        return None
+
+    image = Image.open(io.BytesIO(image_png))
+    image_width, image_height = image.size
+    if image_width <= 0 or image_height <= 0:
+        return None
+    scale_x = image_box["width"] / image_width
+    scale_y = image_box["height"] / image_height
+
+    detected_points: dict[str, list[tuple[float, float]]] = {}
+    for raw_box in boxes:
+        if not isinstance(raw_box, (list, tuple)) or len(raw_box) < 4:
+            continue
+        x1 = max(0, min(int(raw_box[0]), image_width))
+        y1 = max(0, min(int(raw_box[1]), image_height))
+        x2 = max(0, min(int(raw_box[2]), image_width))
+        y2 = max(0, min(int(raw_box[3]), image_height))
+        if x2 - x1 <= 1 or y2 - y1 <= 1:
+            continue
+
+        token = ""
+        try:
+            token = _normalize_click_token(str(text_ocr.classification(_crop_png(image, (x1, y1, x2, y2))) or ""))
+        except Exception:
+            token = ""
+        if not token:
+            continue
+
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        page_x = image_box["x"] + center_x * scale_x
+        page_y = image_box["y"] + center_y * scale_y
+        detected_points.setdefault(token, []).append((page_x, page_y))
+
+    if not detected_points:
+        return None
+
+    selected_points: list[tuple[float, float]] = []
+    used_counts: dict[str, int] = {}
+    for raw_target in targets:
+        target = _normalize_click_token(raw_target)
+        if not target:
+            return None
+        candidates = detected_points.get(target)
+        if not candidates:
+            return None
+        used_idx = used_counts.get(target, 0)
+        if used_idx >= len(candidates):
+            return None
+        selected_points.append(candidates[used_idx])
+        used_counts[target] = used_idx + 1
+    return selected_points
+
+
+async def _solve_click_captcha(page: Page, timeout_ms: int, selectors: dict) -> None:
+    image_selector = _resolve_captcha_selector(
+        selectors,
+        "click",
+        "image",
+        legacy_keys=("captcha_click_image", "captcha_click_image_selector"),
+    )
+    prompt_selector = _resolve_captcha_selector(
+        selectors,
+        "click",
+        "prompt",
+        legacy_keys=("captcha_click_prompt", "captcha_click_prompt_selector"),
+    )
+    refresh_selector = _resolve_captcha_selector(
+        selectors,
+        "click",
+        "refresh",
+        legacy_keys=("captcha_click_refresh", "captcha_click_refresh_selector"),
+    )
+    confirm_selector = _resolve_captcha_selector(
+        selectors,
+        "click",
+        "confirm",
+        legacy_keys=("captcha_click_confirm", "captcha_click_confirm_selector"),
+    )
+    error_selector = _resolve_captcha_selector(
+        selectors,
+        "click",
+        "error",
+        legacy_keys=("captcha_click_error", "captcha_click_error_selector"),
+    )
+    if not image_selector or not prompt_selector:
+        raise RuntimeError("captcha_click requires selectors: captcha.click.image and captcha.click.prompt")
+
+    image_locator = page.locator(image_selector).first
+    prompt_locator = page.locator(prompt_selector).first
+    refresh_locator = page.locator(refresh_selector).first if refresh_selector else None
+    confirm_locator = page.locator(confirm_selector).first if confirm_selector else None
+    error_locator = page.locator(error_selector).first if error_selector else None
+    detect_ocr = _new_detection_ocr()
+    text_ocr = _new_text_ocr("captcha_click")
+
+    await image_locator.wait_for(state="visible", timeout=timeout_ms)
+    await prompt_locator.wait_for(state="visible", timeout=timeout_ms)
+
+    for _attempt in range(1, 4):
+        prompt_text = (await prompt_locator.inner_text()).strip()
+        targets = _extract_click_targets(prompt_text)
+        if not targets:
+            raise RuntimeError("Cannot parse click captcha prompt text.")
+
+        image_png = await image_locator.screenshot()
+        image_box = await image_locator.bounding_box()
+        if not image_box:
+            raise RuntimeError("Cannot resolve click captcha image bounding box.")
+
+        points = _detect_click_target_points(
+            image_png=image_png,
+            targets=targets,
+            detect_ocr=detect_ocr,
+            text_ocr=text_ocr,
+            image_box=image_box,
+        )
+        if points is None:
+            if refresh_locator is not None:
+                await refresh_locator.click()
+                await page.wait_for_timeout(400)
+            continue
+
+        for page_x, page_y in points:
+            await page.mouse.click(page_x, page_y, delay=random.randint(30, 90))
+            await page.wait_for_timeout(random.randint(120, 220))
+
+        if confirm_locator is not None:
+            await confirm_locator.click()
+            await page.wait_for_timeout(300)
+
+        if error_locator is not None:
+            try:
+                error_text = (await error_locator.inner_text()).strip()
+                if error_text:
+                    if refresh_locator is not None:
+                        await refresh_locator.click()
+                        await page.wait_for_timeout(400)
+                    continue
+            except Exception:
+                pass
+        return
+
+    raise RuntimeError("Click captcha recognition failed after 3 attempts.")
 
 
 def _get_origin(url: str) -> str:

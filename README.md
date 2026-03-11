@@ -14,7 +14,16 @@
 | 加密         | Cryptography | 敏感信息加密           |
 | 日志         | Loguru       | 结构化日志管理         |
 | 监控         | Sentry       | 异常监控与报警         |
-| 验证码       | dddddocr     | 验证码识别             |
+| 验证码       | ddddocr      | 验证码识别             |
+| mcp框架      | MCP          | mcp服务能力             |
+
+
+### 项目运行
+
+```bash
+uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 --workers 1
+
+```
 
 ### 测试系统
 
@@ -66,7 +75,49 @@
 - CLI:
   - `python scripts/refresh-storage-state.py --sys-code ele.vben.pro --headed`
 
-## 菜单地图采集（DB状态驱动）
+### login_auth 处理规则
+
+- 认证挑战分发只读取 `web_systems.login_auth` 字段：
+  - `captcha_slider`：滑块验证码（`ddddocr.slide_match`）
+  - `captcha_image`：图形验证码（`ddddocr.classification`）
+  - `captcha_click`：点选验证码（`ddddocr.detection + classification`）
+  - `captcha_sms`、`sso`：当前未实现，触发明确报错（fail-fast）
+  - `none`：不处理验证码
+
+### login_selectors 推荐配置（captcha 子对象）
+
+```json
+{
+  "username": "#username",
+  "password": "#password",
+  "submit": "button[type='submit']",
+  "captcha": {
+    "slider": {
+      "track": "#slider-track",
+      "handle": ".slider-handle",
+      "hint": ".slider-hint"
+    },
+    "image": {
+      "image": ".captcha-image",
+      "input": "input[name='captcha']",
+      "refresh": ".captcha-refresh",
+      "error": ".captcha-error"
+    },
+    "click": {
+      "image": ".click-captcha-image",
+      "prompt": ".click-captcha-prompt",
+      "refresh": ".click-captcha-refresh",
+      "confirm": ".click-captcha-confirm",
+      "error": ".click-captcha-error"
+    }
+  }
+}
+```
+
+- 兼容说明：系统会优先读取 `captcha.*`，同时兼容历史扁平字段（例如 `captcha_image`、`captcha_input`、`captcha_click_image` 等）。
+- `slider.hint` 为可选：优先使用数据库配置；未配置时会在滑块区域内自动探测提示元素，探测失败会给出明确报错并提示补齐配置。
+
+## 菜单地图采集（DB 状态驱动）
 
 - API:
   - `POST /api/crawl/run/{sys_code}`: 使用 DB 中最新有效 `storage_states` 触发采集并写入 `nav_menus/app_pages/ui_containers/ui_elements`
@@ -80,7 +131,3 @@
 - `nav_menus`: `node_path`、`source`、`is_ai_primary_candidate`、`ai_candidate_rank`
 - `app_pages`: `page_summary`、`keywords`、`actionable_element_count`、`elements_raw_count`、`elements_filtered_out_count`
 - `ui_elements`: `dom_css_path`、`locator_tier`、`stability_score`、`is_global_chrome`、`is_business_useful`、`usage_description`
-
-对已有数据库执行一次迁移：
-
-- `python scripts/migrate-ai-context-schema.py`
