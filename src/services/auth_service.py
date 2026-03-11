@@ -349,42 +349,72 @@ class AuthService:
         validation: ValidationResult,
     ) -> UUID:
         now = _utc_now()
+        state_id = await self._resolve_existing_state_id(system.id, system.latest_valid_state_id)
+        encrypted_auth = self.crypto.encrypt(analysis.authorization_value)
 
-        invalidate_stmt = (
-            update(StorageState)
-            .where(StorageState.system_id == system.id, StorageState.is_valid.is_(True))
-            .values(is_valid=False, updated_at=now)
+        invalidate_stmt = update(StorageState).where(
+            StorageState.system_id == system.id,
+            StorageState.is_valid.is_(True),
         )
+        if state_id is not None:
+            invalidate_stmt = invalidate_stmt.where(StorageState.id != state_id)
+        invalidate_stmt = invalidate_stmt.values(is_valid=False, updated_at=now)
         await self.session.exec(invalidate_stmt)
 
-        encrypted_auth = self.crypto.encrypt(analysis.authorization_value)
-        state = StorageState(
-            system_id=system.id,
-            storage_state=capture.storage_state,
-            cookies=capture.cookies,
-            local_storage=capture.local_storage,
-            session_storage=capture.session_storage,
-            request_headers=capture.request_headers,
-            auth_mode=analysis.auth_mode,
-            playback_strategy=analysis.playback_strategy,
-            authorization_source=analysis.authorization_source,
-            authorization_schema=analysis.authorization_schema,
-            authorization_value=encrypted_auth,
-            auth_fingerprint=analysis.auth_fingerprint,
-            validate_status_code=validation.status_code,
-            validate_response_ms=validation.response_ms,
-            validate_error=validation.error,
-            is_valid=True,
-            validated_at=now,
-        )
-        self.session.add(state)
-        await self.session.flush()
+        if state_id is None:
+            state = StorageState(
+                system_id=system.id,
+                storage_state=capture.storage_state,
+                cookies=capture.cookies,
+                local_storage=capture.local_storage,
+                session_storage=capture.session_storage,
+                request_headers=capture.request_headers,
+                auth_mode=analysis.auth_mode,
+                playback_strategy=analysis.playback_strategy,
+                authorization_source=analysis.authorization_source,
+                authorization_schema=analysis.authorization_schema,
+                authorization_value=encrypted_auth,
+                auth_fingerprint=analysis.auth_fingerprint,
+                validate_status_code=validation.status_code,
+                validate_response_ms=validation.response_ms,
+                validate_error=validation.error,
+                is_valid=True,
+                validated_at=now,
+            )
+            self.session.add(state)
+            await self.session.flush()
+            state_id = state.id
+        else:
+            update_state_stmt = (
+                update(StorageState)
+                .where(StorageState.id == state_id, StorageState.system_id == system.id)
+                .values(
+                    storage_state=capture.storage_state,
+                    cookies=capture.cookies,
+                    local_storage=capture.local_storage,
+                    session_storage=capture.session_storage,
+                    request_headers=capture.request_headers,
+                    auth_mode=analysis.auth_mode,
+                    playback_strategy=analysis.playback_strategy,
+                    authorization_source=analysis.authorization_source,
+                    authorization_schema=analysis.authorization_schema,
+                    authorization_value=encrypted_auth,
+                    auth_fingerprint=analysis.auth_fingerprint,
+                    validate_status_code=validation.status_code,
+                    validate_response_ms=validation.response_ms,
+                    validate_error=validation.error,
+                    is_valid=True,
+                    validated_at=now,
+                    updated_at=now,
+                )
+            )
+            await self.session.exec(update_state_stmt)
 
         update_system_stmt = (
             update(WebSystem)
             .where(WebSystem.id == system.id)
             .values(
-                latest_valid_state_id=state.id,
+                latest_valid_state_id=state_id,
                 last_auth_at=now,
                 last_auth_validation_at=now if validation.is_valid is not None else system.last_auth_validation_at,
                 auth_fail_count=0,
@@ -395,7 +425,26 @@ class AuthService:
         )
         await self.session.exec(update_system_stmt)
         await self.session.commit()
-        return state.id
+        return state_id
+
+    async def _resolve_existing_state_id(
+        self,
+        system_id: UUID,
+        preferred_state_id: UUID | None,
+    ) -> UUID | None:
+        if preferred_state_id is not None:
+            preferred = await self.session.get(StorageState, preferred_state_id)
+            if preferred is not None and preferred.system_id == system_id:
+                return preferred.id
+
+        stmt = (
+            select(StorageState.id)
+            .where(StorageState.system_id == system_id)
+            .order_by(StorageState.validated_at.desc(), StorageState.created_at.desc(), StorageState.id.desc())
+            .limit(1)
+        )
+        result = await self.session.exec(stmt)
+        return result.first()
 
 
 def analyze_auth_payload(

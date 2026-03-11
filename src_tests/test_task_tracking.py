@@ -17,8 +17,8 @@ from src.models.database import close_db, get_session_factory, init_db, ping_db,
 from src.models.storage_state import StorageState
 from src.models.web_system import WebSystem
 from src.scheduler.locks import distributed_lock
-from src.services.auth_service import AuthService
-from src.services.crawl_service import CrawlService
+from src.services.auth_service import AuthAnalysis, AuthService
+from src.services.crawl_service import CrawlService, _build_payload_fingerprint
 from src.services.validator_service import ValidationResult
 
 
@@ -183,6 +183,84 @@ async def test_auth_refresh_writes_skipped_task_log_when_lock_held(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auth_service_save_state_updates_existing_state_instead_of_inserting():
+    if not await ping_db():
+        pytest.skip("PostgreSQL is not reachable in current environment.")
+
+    system = await _create_system(with_credentials=True)
+
+    async with session_scope() as session:
+        service = AuthService(session)
+
+        capture_v1 = AuthCapture(
+            base_url=system.login_url,
+            current_url=f"{system.base_url}/#/home",
+            storage_state={"cookies": [{"name": "sid", "value": "v1"}], "origins": []},
+            cookies=[{"name": "sid", "value": "v1"}],
+            local_storage={"token": "token-v1"},
+            session_storage={},
+            request_headers={"authorization": "Bearer token-v1"},
+            authorization="Bearer token-v1",
+        )
+        analysis_v1 = AuthAnalysis(
+            auth_mode="hybrid",
+            playback_strategy="hybrid",
+            authorization_source="request_header",
+            authorization_schema="Bearer",
+            authorization_value="Bearer token-v1",
+            auth_fingerprint="fp-v1",
+        )
+        state_id_v1 = await service._save_state(
+            system,
+            capture_v1,
+            analysis_v1,
+            ValidationResult(is_valid=True, status_code=200, response_ms=20, error=None),
+        )
+
+        capture_v2 = AuthCapture(
+            base_url=system.login_url,
+            current_url=f"{system.base_url}/#/dashboard",
+            storage_state={"cookies": [{"name": "sid", "value": "v2"}], "origins": []},
+            cookies=[{"name": "sid", "value": "v2"}],
+            local_storage={"token": "token-v2"},
+            session_storage={"refresh_token": "refresh-v2"},
+            request_headers={"authorization": "Bearer token-v2"},
+            authorization="Bearer token-v2",
+        )
+        analysis_v2 = AuthAnalysis(
+            auth_mode="hybrid",
+            playback_strategy="hybrid",
+            authorization_source="request_header",
+            authorization_schema="Bearer",
+            authorization_value="Bearer token-v2",
+            auth_fingerprint="fp-v2",
+        )
+        state_id_v2 = await service._save_state(
+            system,
+            capture_v2,
+            analysis_v2,
+            ValidationResult(is_valid=True, status_code=200, response_ms=35, error=None),
+        )
+
+        states = (
+            await session.exec(
+                select(StorageState)
+                .where(StorageState.system_id == system.id)
+                .order_by(StorageState.created_at.desc(), StorageState.id.desc())
+            )
+        ).all()
+        persisted_system = await session.get(WebSystem, system.id)
+
+    assert state_id_v2 == state_id_v1
+    assert len(states) == 1
+    assert states[0].is_valid is True
+    assert states[0].storage_state["cookies"][0]["value"] == "v2"
+    assert states[0].validate_response_ms == 35
+    assert persisted_system is not None
+    assert persisted_system.latest_valid_state_id == state_id_v1
+
+
+@pytest.mark.asyncio
 async def test_crawl_service_writes_success_task_log(tmp_path: Path, monkeypatch):
     if not await ping_db():
         pytest.skip("PostgreSQL is not reachable in current environment.")
@@ -216,9 +294,67 @@ async def test_crawl_service_writes_success_task_log(tmp_path: Path, monkeypatch
     log = await _latest_task_log(system.id, "crawl_menu")
     assert log is not None
     assert log.status == "success"
+    assert log.changed is True
     assert log.pages_found == 2
     assert log.elements_found == 3
     assert log.duration_ms is not None
+
+
+@pytest.mark.asyncio
+async def test_crawl_service_skips_persist_when_payload_unchanged(tmp_path: Path, monkeypatch):
+    if not await ping_db():
+        pytest.skip("PostgreSQL is not reachable in current environment.")
+
+    system = await _create_system(with_credentials=True)
+    await _create_valid_state(system.id)
+    payload = {
+        "meta": {"state_valid": True},
+        "menus": [{"title": "分析页", "route_path": "/analytics", "target_url": "https://example.com/#/analytics"}],
+        "pages": [
+            {
+                "url_pattern": "/analytics",
+                "target_url": "https://example.com/#/analytics",
+                "elements": [{"tag_name": "button", "element_type": "action_btn", "dom_css_path": "div > button"}],
+            }
+        ],
+    }
+    payload_fp = _build_payload_fingerprint(payload)
+
+    async with session_scope() as session:
+        service = CrawlService(session)
+
+        async def fake_run_crawler_script(**_kwargs):
+            output = tmp_path / "crawl-output-unchanged.json"
+            output.write_text(json.dumps(payload), encoding="utf-8")
+            return output
+
+        async def fake_persist_payload(*_args, **_kwargs):
+            raise AssertionError("_persist_payload should not be called when payload is unchanged")
+
+        async def fake_existing_fp(_system_id):
+            return payload_fp
+
+        async def fake_snapshot_counts(_system_id):
+            return {"menus": 12, "pages": 6, "elements": 52}
+
+        monkeypatch.setattr(service, "_run_crawler_script", fake_run_crawler_script)
+        monkeypatch.setattr(service, "_persist_payload", fake_persist_payload)
+        monkeypatch.setattr(service, "_build_existing_snapshot_fingerprint", fake_existing_fp)
+        monkeypatch.setattr(service, "_current_snapshot_counts", fake_snapshot_counts)
+
+        result = await service.run_by_sys_code(system.sys_code)
+
+    assert result.status == "success"
+    assert result.menus_saved == 0
+    assert result.pages_saved == 0
+    assert result.elements_saved == 0
+    assert "unchanged" in result.message.lower()
+    log = await _latest_task_log(system.id, "crawl_menu")
+    assert log is not None
+    assert log.status == "success"
+    assert log.changed is False
+    assert log.pages_found == 6
+    assert log.elements_found == 52
 
 
 @pytest.mark.asyncio
