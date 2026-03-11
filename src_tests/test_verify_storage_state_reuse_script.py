@@ -23,6 +23,20 @@ def _load_script_module():
 verify_script = _load_script_module()
 
 
+def _load_generate_and_run_module():
+    generate_script_path = Path(__file__).resolve().parents[1] / "scripts" / "generate_and_run.py"
+    spec = importlib.util.spec_from_file_location("generate_and_run_script", generate_script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+generate_script = _load_generate_and_run_module()
+
+
 def _make_result(reusable: bool):
     return verify_script.VerifyResult(
         sys_code="demo",
@@ -113,3 +127,70 @@ def test_exit_code_for_results():
     assert verify_script._exit_code_for_results([]) == 1
     assert verify_script._exit_code_for_results([_make_result(True), _make_result(True)]) == 0
     assert verify_script._exit_code_for_results([_make_result(True), _make_result(False)]) == 2
+
+
+def test_generate_script_parse_dialogues_infers_three_intents():
+    dialogues = [
+        "帮我看一下滑动窗口系统工作台页面中的点击首页是否正常",
+        "帮我看一下滑动窗口系统分析夜中当前访问量是多少",
+        "帮我看一下滑动窗口系统表单演示页面是否能正常打开",
+    ]
+
+    intents = generate_script.parse_dialogues(dialogues)
+
+    assert [item.intent_type for item in intents] == ["click_home", "read_visits", "open_form"]
+    assert [item.page_keyword for item in intents] == ["工作台", "分析页", "表单演示"]
+    assert all(item.system_keyword == "滑动窗口系统" for item in intents)
+
+
+def test_generate_script_parse_dialogues_respects_forced_system_keyword():
+    intents = generate_script.parse_dialogues(
+        ["帮我看一下A系统工作台页面中的点击首页是否正常"],
+        forced_system_keyword="覆盖系统",
+    )
+    assert len(intents) == 1
+    assert intents[0].system_keyword == "覆盖系统"
+
+
+def test_generate_script_parse_dialogues_requires_system_keyword():
+    with pytest.raises(ValueError, match="系统名称"):
+        generate_script.parse_dialogues(["帮我看一下工作台页面是否正常"])
+
+
+def test_generate_script_parse_locator_supports_text_role_and_css():
+    text_kind = generate_script._parse_locator("get_by_text('提交')")
+    role_kind = generate_script._parse_locator("get_by_role('button', name='新增')")
+    css_kind = generate_script._parse_locator("#main > .btn")
+
+    assert text_kind == ("get_by_text", "提交", None)
+    assert role_kind == ("get_by_role", "button", "新增")
+    assert css_kind == ("css", "#main > .btn", None)
+
+
+def test_generate_script_pick_home_locator_prefers_home_related_descriptions():
+    locators = [
+        {
+            "playwright_locator": "#v-1",
+            "text_content": "",
+            "nearby_text": "",
+            "usage_description": "点击后回到首页",
+        },
+        {
+            "playwright_locator": "#v-2",
+            "text_content": "提交",
+            "nearby_text": "",
+            "usage_description": "提交表单",
+        },
+    ]
+    assert generate_script._pick_home_locator(locators) == "#v-1"
+
+
+def test_generate_script_normalize_dialogue_text_rewrites_common_typo():
+    assert generate_script._normalize_dialogue_text("分析夜") == "分析页"
+
+
+def test_generate_script_parse_args_uses_fast_defaults():
+    args = generate_script.parse_args([])
+    assert args.timeout_ms == 8000
+    assert args.slow_mo == 50
+    assert args.headless is False
