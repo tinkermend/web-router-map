@@ -17,6 +17,8 @@ from sqlalchemy import delete, text, update
 from sqlmodel import desc, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+from src.config.settings import get_settings
+from src.infrastructure.logging import get_logger
 from src.models.app_page import AppPage
 from src.models.nav_menu import NavMenu
 from src.models.storage_state import StorageState
@@ -25,6 +27,7 @@ from src.models.ui_element import UIElement
 from src.models.web_system import WebSystem
 from src.scheduler.locks import distributed_lock
 from src.services.auth_service import AuthService
+from src.services.crypto_service import CryptoService
 from src.services.task_tracker import TaskTracker
 
 DEFAULT_HOME_PATH = "#/analytics"
@@ -33,6 +36,7 @@ DEFAULT_MAX_ELEMENTS_PER_PAGE = 180
 DEFAULT_MAX_MODAL_TRIGGERS = 8
 DEFAULT_EXPAND_ROUNDS = 6
 DEFAULT_TIMEOUT_MS = 45_000
+service_logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -58,6 +62,7 @@ class CrawlService:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
         self.task_tracker = TaskTracker(session)
+        self.crypto = CryptoService(get_settings().encryption_key)
 
     async def run_by_sys_code(
         self,
@@ -74,9 +79,16 @@ class CrawlService:
     ) -> CrawlRunResult:
         started_at = _utc_now()
         task_log_id: UUID | None = None
+        crawl_logger = service_logger.bind(sys_code=sys_code, task_type="crawl_menu", headed=headed)
+        crawl_logger.bind(
+            timeout_ms=timeout_ms,
+            max_pages=max_pages,
+            max_elements_per_page=max_elements_per_page,
+        ).info("Crawl run started")
         system = await self._get_active_system(sys_code)
         if system is None:
             finished_at = _utc_now()
+            crawl_logger.warning("Crawl aborted: system not found or inactive")
             return CrawlRunResult(
                 sys_code=sys_code,
                 status="failed",
@@ -97,9 +109,12 @@ class CrawlService:
             target_url=home_url or self._default_home_url(system),
         )
         task_log_id = task_log.id
+        crawl_logger = crawl_logger.bind(log_id=str(task_log_id))
+        crawl_logger.info("Crawl task log created")
 
         state = await self._get_valid_state(system)
         if state is None:
+            crawl_logger.warning("No valid storage state found, triggering auth refresh")
             auth_result = await AuthService(self.session).refresh_by_sys_code(sys_code)
             finished_at = _utc_now()
             await self.task_tracker.finish(
@@ -108,6 +123,7 @@ class CrawlService:
                 error_message=f"No valid state. Auth refresh result: {auth_result.status}",
                 retry_count=0,
             )
+            crawl_logger.bind(auth_status=auth_result.status).info("Crawl switched to auth refresh")
             return CrawlRunResult(
                 sys_code=sys_code,
                 status="auth_triggered",
@@ -126,6 +142,7 @@ class CrawlService:
         async with distributed_lock.acquire(lock_name) as acquired:
             if not acquired:
                 finished_at = _utc_now()
+                crawl_logger.warning("Crawl skipped: lock is already held")
                 await self.task_tracker.finish(
                     log_id=task_log_id,
                     status="skipped",
@@ -148,6 +165,7 @@ class CrawlService:
 
             output_path: Path | None = None
             try:
+                crawl_logger.info("Executing crawler script")
                 output_path = await self._run_crawler_script(
                     system=system,
                     state=state,
@@ -161,8 +179,10 @@ class CrawlService:
                     home_url=home_url or self._default_home_url(system),
                 )
                 payload = json.loads(output_path.read_text(encoding="utf-8"))
+                crawl_logger.bind(output_path=str(output_path)).info("Crawler script finished and output loaded")
 
                 if not bool(payload.get("meta", {}).get("state_valid")):
+                    crawl_logger.warning("Crawler reported invalid state, triggering auth refresh")
                     auth_result = await AuthService(self.session).refresh_by_sys_code(sys_code)
                     await self.task_tracker.finish(
                         log_id=task_log_id,
@@ -171,6 +191,7 @@ class CrawlService:
                         retry_count=0,
                     )
                     finished_at = _utc_now()
+                    crawl_logger.bind(auth_status=auth_result.status).info("Crawl switched to auth refresh")
                     return CrawlRunResult(
                         sys_code=sys_code,
                         status="auth_triggered",
@@ -201,6 +222,11 @@ class CrawlService:
                     pages_found=save_result["pages_saved"],
                     elements_found=save_result["elements_saved"],
                 )
+                crawl_logger.bind(
+                    menus_saved=save_result["menus_saved"],
+                    pages_saved=save_result["pages_saved"],
+                    elements_saved=save_result["elements_saved"],
+                ).info("Crawl run succeeded")
 
                 finished_at = _utc_now()
                 return CrawlRunResult(
@@ -217,6 +243,7 @@ class CrawlService:
                     finished_at=finished_at,
                 )
             except Exception as exc:
+                crawl_logger.exception("Crawl run failed")
                 await self.session.rollback()
                 await self.task_tracker.finish(
                     log_id=task_log_id,
@@ -240,9 +267,7 @@ class CrawlService:
                 )
 
     async def _persist_payload(self, system_id: UUID, payload: dict[str, Any]) -> dict[str, int]:
-        menus = payload.get("menus") or []
-        pages = payload.get("pages") or []
-        payload_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        menus, pages, payload_meta = _validate_payload_before_overwrite(payload)
 
         page_ids_subq = select(AppPage.id).where(AppPage.system_id == system_id)
         await self.session.exec(delete(UIElement).where(UIElement.page_id.in_(page_ids_subq)))
@@ -452,6 +477,7 @@ class CrawlService:
     ) -> Path:
         runtime_dir = Path("output/playwright/runtime").resolve() / f"{system.sys_code}-{int(_utc_now().timestamp())}"
         runtime_dir.mkdir(parents=True, exist_ok=True)
+        script_logger = service_logger.bind(sys_code=system.sys_code, task_type="crawl_menu")
 
         storage_state_path = runtime_dir / "storage-state.json"
         auth_input_path = runtime_dir / "auth.json"
@@ -459,11 +485,15 @@ class CrawlService:
         screenshot_dir = runtime_dir / "screenshots"
 
         storage_state_path.write_text(json.dumps(state.storage_state, ensure_ascii=False), encoding="utf-8")
+        authorization = self._resolve_state_authorization(state)
+        request_headers = {str(k): str(v) for k, v in (state.request_headers or {}).items() if v is not None}
+        if authorization and not any(str(key).lower() == "authorization" for key in request_headers):
+            request_headers["authorization"] = authorization
         auth_payload = {
             "base_url": system.login_url or system.base_url,
             "current_url": home_url,
-            "authorization": None,
-            "request_headers": state.request_headers or {},
+            "authorization": authorization,
+            "request_headers": request_headers,
             "cookies": state.cookies or [],
             "local_storage": state.local_storage or {},
             "session_storage": state.session_storage or {},
@@ -500,6 +530,9 @@ class CrawlService:
         if headed:
             cmd.append("--headed")
 
+        script_logger.bind(runtime_dir=str(runtime_dir), output_path=str(output_path)).info(
+            "Launching crawl script subprocess"
+        )
         result = await asyncio.to_thread(
             subprocess.run,
             cmd,
@@ -509,14 +542,27 @@ class CrawlService:
             check=False,
         )
         if result.returncode != 0:
+            script_logger.bind(returncode=result.returncode).error("Crawl script failed")
             raise RuntimeError(
                 "crawl-menu-map.py failed"
                 f"\nstdout:\n{result.stdout}\n"
                 f"stderr:\n{result.stderr}"
             )
         if not output_path.exists():
+            script_logger.error("Crawl script output missing")
             raise RuntimeError(f"Crawler output missing: {output_path}")
+        script_logger.info("Crawl script completed successfully")
         return output_path
+
+    def _resolve_state_authorization(self, state: StorageState) -> str | None:
+        raw = state.authorization_value
+        if not raw:
+            return None
+        try:
+            plain = self.crypto.decrypt(raw) or raw
+        except Exception:
+            plain = raw
+        return _normalize_authorization_value(plain, state.authorization_schema)
 
     async def _get_active_system(self, sys_code: str) -> WebSystem | None:
         stmt = select(WebSystem).where(WebSystem.sys_code == sys_code, WebSystem.is_active.is_(True))
@@ -569,6 +615,32 @@ class CrawlService:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _validate_payload_before_overwrite(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    menus = payload.get("menus") or []
+    pages = payload.get("pages") or []
+    if not isinstance(menus, list) or not isinstance(pages, list):
+        raise RuntimeError("Crawler payload format invalid: menus/pages must be arrays.")
+    if not menus and not pages:
+        raise RuntimeError("Crawler payload empty: refused to overwrite existing crawl snapshot.")
+    payload_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    return menus, pages, payload_meta
+
+
+def _normalize_authorization_value(raw_value: Any, schema: str | None) -> str | None:
+    value = str(raw_value or "").strip()
+    if not value:
+        return None
+
+    normalized_schema = str(schema or "").strip()
+    if not normalized_schema:
+        return value
+
+    prefixed = f"{normalized_schema} "
+    if value.lower().startswith(prefixed.lower()):
+        return value
+    return f"{normalized_schema} {value}"
 
 
 def _to_int(value: Any) -> int | None:

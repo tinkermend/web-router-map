@@ -1221,7 +1221,10 @@ def main() -> None:
     login_url = auth_payload.get("base_url") or DEFAULT_LOGIN_URL
     origin = _origin_of(login_url)
     home_url = args.home_url or auth_payload.get("current_url") or DEFAULT_HOME_URL
-    request_headers = auth_payload.get("request_headers") or {}
+    request_headers = {str(k): str(v) for k, v in (auth_payload.get("request_headers") or {}).items() if v is not None}
+    authorization = str(auth_payload.get("authorization") or "").strip()
+    if authorization and not any(str(key).lower() == "authorization" for key in request_headers):
+        request_headers["authorization"] = authorization
     local_storage = auth_payload.get("local_storage") or {}
     session_storage = auth_payload.get("session_storage") or {}
 

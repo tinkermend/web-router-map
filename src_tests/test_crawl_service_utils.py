@@ -1,4 +1,5 @@
 from datetime import datetime
+from types import SimpleNamespace
 
 from src.services.crawl_service import (
     CrawlService,
@@ -6,12 +7,15 @@ from src.services.crawl_service import (
     _extract_page_keywords,
     _infer_usage_description,
     _normalize_ltree_path,
+    _normalize_authorization_value,
     _parse_dt,
     _safe_str,
     _to_bool,
     _to_float,
     _to_int,
+    _validate_payload_before_overwrite,
 )
+from src.services.crypto_service import CryptoService
 
 
 def test_to_int_and_to_bool():
@@ -85,3 +89,34 @@ def test_page_summary_keywords_and_usage_description():
         }
     )
     assert input_desc == "用于录入“手机号”相关信息。"
+
+
+def test_validate_payload_before_overwrite():
+    menus, pages, meta = _validate_payload_before_overwrite(
+        {
+            "menus": [{"node_id": "1"}],
+            "pages": [],
+            "meta": {"state_valid": True},
+        }
+    )
+    assert len(menus) == 1
+    assert pages == []
+    assert meta == {"state_valid": True}
+
+    try:
+        _validate_payload_before_overwrite({"menus": [], "pages": []})
+        assert False, "expected RuntimeError for empty payload"
+    except RuntimeError:
+        pass
+
+
+def test_normalize_authorization_value_and_resolve_state_authorization():
+    assert _normalize_authorization_value("token-1", "Bearer") == "Bearer token-1"
+    assert _normalize_authorization_value("Bearer token-1", "Bearer") == "Bearer token-1"
+    assert _normalize_authorization_value("token-1", None) == "token-1"
+
+    service = object.__new__(CrawlService)
+    service.crypto = CryptoService("test-crawl-crypto-key")
+    encrypted = service.crypto.encrypt("token-2")
+    state = SimpleNamespace(authorization_value=encrypted, authorization_schema="Bearer")
+    assert service._resolve_state_authorization(state) == "Bearer token-2"
